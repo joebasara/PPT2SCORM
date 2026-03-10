@@ -1,11 +1,10 @@
-import html
 import io
 import json
 import re
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
@@ -46,39 +45,58 @@ def color_to_rgb(color_obj, default=(0, 0, 0)):
         rgb = getattr(color_obj, "rgb", None)
         if rgb:
             s = str(rgb)
-            return tuple(int(s[i:i+2], 16) for i in (0, 2, 4))
+            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
     except Exception:
         pass
     return default
 
 
-def shape_fill_rgb(shape, default=(255, 255, 255, 0)):
+def shape_fill_rgba(shape, default=(255, 255, 255, 0)):
     try:
         fill = shape.fill
         fc = fill.fore_color
         rgb = getattr(fc, "rgb", None)
         if rgb:
             s = str(rgb)
-            return tuple(int(s[i:i+2], 16) for i in (0, 2, 4)) + (255,)
+            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
     except Exception:
         pass
     return default
 
 
-def shape_line_rgb(shape, default=(0, 0, 0, 255)):
+def shape_has_visible_outline(shape) -> bool:
+    try:
+        line = shape.line
+        color = getattr(line.color, "rgb", None)
+        width = getattr(line, "width", None)
+        if color is None:
+            return False
+        if width is None:
+            return False
+        return float(width) > 0
+    except Exception:
+        return False
+
+
+def shape_line_rgba(shape, default=(0, 0, 0, 0)):
+    if not shape_has_visible_outline(shape):
+        return (0, 0, 0, 0)
+
     try:
         line = shape.line
         c = line.color
         rgb = getattr(c, "rgb", None)
         if rgb:
             s = str(rgb)
-            return tuple(int(s[i:i+2], 16) for i in (0, 2, 4)) + (255,)
+            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
     except Exception:
         pass
     return default
 
 
 def shape_line_width_px(shape, scale: float) -> int:
+    if not shape_has_visible_outline(shape):
+        return 0
     try:
         width_emu = float(shape.line.width)
         px = int(max(1, round((width_emu / 12700.0) * scale)))
@@ -300,9 +318,6 @@ def hotspot_geometry_for_shape(shape, offset_x=0, offset_y=0) -> Dict[str, Any]:
     if auto == MSO_AUTO_SHAPE_TYPE.OVAL:
         return {"geom": "ellipse", "x": x, "y": y, "w": w, "h": h}
 
-    if auto in (MSO_AUTO_SHAPE_TYPE.RECTANGLE, MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE):
-        return {"geom": "rect", "x": x, "y": y, "w": w, "h": h}
-
     return {"geom": "rect", "x": x, "y": y, "w": w, "h": h}
 
 
@@ -311,19 +326,26 @@ def hotspot_geometry_for_shape(shape, offset_x=0, offset_y=0) -> Dict[str, Any]:
 # ============================================================
 
 def draw_line(draw, x1, y1, x2, y2, fill, width):
+    if width <= 0 or len(fill) == 4 and fill[3] == 0:
+        return
     draw.line((x1, y1, x2, y2), fill=fill, width=width)
 
 
 def draw_rect(draw, x, y, w, h, fill, outline, width, radius=0):
     x2, y2 = x + w, y + h
+    outline_arg = outline if width > 0 and not (len(outline) == 4 and outline[3] == 0) else None
+    width_arg = width if outline_arg is not None else 0
+
     if radius > 0:
-        draw.rounded_rectangle((x, y, x2, y2), radius=radius, fill=fill, outline=outline, width=width)
+        draw.rounded_rectangle((x, y, x2, y2), radius=radius, fill=fill, outline=outline_arg, width=width_arg)
     else:
-        draw.rectangle((x, y, x2, y2), fill=fill, outline=outline, width=width)
+        draw.rectangle((x, y, x2, y2), fill=fill, outline=outline_arg, width=width_arg)
 
 
 def draw_ellipse(draw, x, y, w, h, fill, outline, width):
-    draw.ellipse((x, y, x + w, y + h), fill=fill, outline=outline, width=width)
+    outline_arg = outline if width > 0 and not (len(outline) == 4 and outline[3] == 0) else None
+    width_arg = width if outline_arg is not None else 0
+    draw.ellipse((x, y, x + w, y + h), fill=fill, outline=outline_arg, width=width_arg)
 
 
 def arrow_polygon_points(auto, x, y, w, h):
@@ -390,13 +412,38 @@ def draw_text_box(draw, shape, scale: float, offset_x=0, offset_y=0):
     if not paragraphs:
         return
 
-    font_size = max(10, int(18 * scale))
-    font = get_font(font_size, bold=False)
+    first_run = None
+    for para in text_frame.paragraphs:
+        if para.runs:
+            first_run = para.runs[0]
+            break
+
+    font_size = max(14, int(28 * scale))
+    font_bold = False
+    font_fill = (0, 0, 0, 255)
+
+    if first_run:
+        try:
+            fs = getattr(first_run.font, "size", None)
+            if fs is not None:
+                font_size = max(14, int(fs.pt * scale * 1.1))
+        except Exception:
+            pass
+        try:
+            font_bold = bool(getattr(first_run.font, "bold", False))
+        except Exception:
+            pass
+        try:
+            font_fill = color_to_rgb(first_run.font.color, default=(0, 0, 0)) + (255,)
+        except Exception:
+            pass
+
+    font = get_font(font_size, bold=font_bold)
     line_gap = max(2, int(font_size * 0.2))
 
     lines = []
     for txt in paragraphs:
-        wrapped = fit_text_lines(draw, txt, font, max(10, w - 8))
+        wrapped = fit_text_lines(draw, txt, font, max(10, w - 12))
         lines.extend(wrapped if wrapped else [txt])
 
     bbox = draw.textbbox((0, 0), "Ag", font=font)
@@ -407,7 +454,7 @@ def draw_text_box(draw, shape, scale: float, offset_x=0, offset_y=0):
     for line in lines:
         tw = draw.textlength(line, font=font)
         tx = x + max(4, (w - tw) / 2)
-        draw.text((tx, cy), line, font=font, fill=(0, 0, 0, 255))
+        draw.text((tx, cy), line, font=font, fill=font_fill)
         cy += line_h + line_gap
 
 
@@ -418,8 +465,8 @@ def draw_shape_object(draw, shape, scale: float, offset_x=0, offset_y=0):
     w = max(1, emu_to_px(w_emu, scale))
     h = max(1, emu_to_px(h_emu, scale))
 
-    fill = shape_fill_rgb(shape)
-    outline = shape_line_rgb(shape)
+    fill = shape_fill_rgba(shape)
+    outline = shape_line_rgba(shape)
     width = shape_line_width_px(shape, scale)
     auto = get_auto_shape_type(shape)
     shape_type = getattr(shape, "shape_type", None)
@@ -442,7 +489,8 @@ def draw_shape_object(draw, shape, scale: float, offset_x=0, offset_y=0):
 
     pts = arrow_polygon_points(auto, x, y, w, h)
     if pts:
-        draw.polygon(pts, fill=fill, outline=outline)
+        outline_arg = outline if width > 0 and not (len(outline) == 4 and outline[3] == 0) else None
+        draw.polygon(pts, fill=fill, outline=outline_arg)
         return
 
     if auto is not None:
@@ -810,13 +858,6 @@ body {{
   cursor: pointer;
   min-width: 100px;
 }}
-.footer {{
-  text-align: center;
-  background: #1a1a1a;
-  color: #bbb;
-  font-size: 13px;
-  padding: 8px 16px 14px;
-}}
 </style>
 </head>
 <body>
@@ -843,8 +884,6 @@ body {{
       <button onclick="prevSlide()">Previous</button>
       <button onclick="nextSlide()">Next</button>
     </div>
-
-    <div class="footer">Static slide image with internal-link hotspots.</div>
   </div>
 </div>
 
@@ -1039,7 +1078,7 @@ with st.expander("What this version supports"):
 - Normal inserted pictures
 - Cropped pictures
 - Slide background images
-- Text rendered into the slide image
+- Larger rendered text
 - Basic shapes: circles/ovals, rectangles, rounded rectangles, lines, simple arrows
 - Internal slide-jump hotspots
 - HTML hotspot overlays
