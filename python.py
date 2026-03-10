@@ -1,306 +1,492 @@
 import base64
 import html
 import io
-import json
 import math
 import os
 import re
-import shutil
-import subprocess
-import tempfile
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 import streamlit as st
-from PIL import Image
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.enum.action import PP_ACTION
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_SHAPE_TYPE
+
+
+st.set_page_config(page_title="PPT to HTML + SCORM", layout="wide")
+st.title("PPT to HTML + SCORM")
 
 
 # =========================
-# App config
+# Utility helpers
 # =========================
-st.set_page_config(page_title="PPT to SCORM", layout="wide")
-st.title("PPT to SCORM Package Generator")
+EMU_PER_INCH = 914400
+PX_PER_INCH = 96
 
 
-# =========================
-# Helpers
-# =========================
+def emu_to_px(emu: int) -> float:
+    return emu * PX_PER_INCH / EMU_PER_INCH
+
+
 def sanitize_filename(name: str) -> str:
     name = re.sub(r"[^\w\-. ]+", "_", name).strip()
     return name or "package"
 
 
-def px_from_emu(emu: int) -> float:
-    # 1 inch = 914400 EMU, 96 px = 1 inch
-    return emu * 96.0 / 914400.0
+def css_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def shape_has_internal_jump(shape) -> tuple[bool, int | None]:
-    """
-    Returns (True, target_slide_index_1_based) if shape has an internal jump action.
-    Otherwise returns (False, None).
-    """
+def html_text(s: str) -> str:
+    return html.escape(s).replace("\n", "<br>")
+
+
+def rgb_to_css(rgb) -> Optional[str]:
     try:
-        click_action = shape.click_action
-        action = click_action.action
-
-        # Common internal jump types
-        if action == PP_ACTION.NAMED_SLIDE:
-            target = click_action.target_slide
-            if target is not None:
-                return True, target.slide_id
-
-        if action == PP_ACTION.FIRST_SLIDE:
-            return True, -1
-
-        if action == PP_ACTION.LAST_SLIDE:
-            return True, -2
-
-        if action == PP_ACTION.NEXT_SLIDE:
-            return True, -3
-
-        if action == PP_ACTION.PREVIOUS_SLIDE:
-            return True, -4
-
+        if rgb is None:
+            return None
+        if isinstance(rgb, RGBColor):
+            return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+        if hasattr(rgb, "__iter__"):
+            vals = list(rgb)
+            if len(vals) >= 3:
+                return f"#{vals[0]:02x}{vals[1]:02x}{vals[2]:02x}"
     except Exception:
         pass
+    return None
 
-    return False, None
+
+def get_solid_fill_css(shape) -> Optional[str]:
+    try:
+        fill = shape.fill
+        if fill is None:
+            return None
+        if fill.type == 1:  # solid
+            fore = fill.fore_color
+            color = rgb_to_css(getattr(fore, "rgb", None))
+            if color:
+                return color
+    except Exception:
+        pass
+    return None
+
+
+def get_line_css(shape) -> tuple[Optional[str], Optional[float]]:
+    color = None
+    width = None
+    try:
+        line = shape.line
+        if line is not None:
+            color = rgb_to_css(getattr(line.color, "rgb", None))
+            if getattr(line, "width", None):
+                width = emu_to_px(line.width)
+    except Exception:
+        pass
+    return color, width
+
+
+def get_rotation_deg(shape) -> float:
+    try:
+        return float(shape.rotation or 0)
+    except Exception:
+        return 0.0
+
+
+def blob_to_data_uri(blob: bytes, ext: str) -> str:
+    ext = (ext or "").lower().strip(".")
+    mime_map = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "bmp": "image/bmp",
+        "svg": "image/svg+xml",
+        "tif": "image/tiff",
+        "tiff": "image/tiff",
+        "webp": "image/webp",
+        "wmf": "image/wmf",
+        "emf": "image/emf",
+    }
+    mime = mime_map.get(ext, "application/octet-stream")
+    b64 = base64.b64encode(blob).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+def get_shape_action_target(shape, slide_index: int, total_slides: int, slide_id_to_index: dict[int, int]) -> Optional[int]:
+    try:
+        action = shape.click_action.action
+
+        if action == PP_ACTION.NAMED_SLIDE:
+            target = shape.click_action.target_slide
+            if target is not None:
+                return slide_id_to_index.get(target.slide_id)
+
+        if action == PP_ACTION.FIRST_SLIDE:
+            return 1
+        if action == PP_ACTION.LAST_SLIDE:
+            return total_slides
+        if action == PP_ACTION.NEXT_SLIDE:
+            return min(total_slides, slide_index + 1)
+        if action == PP_ACTION.PREVIOUS_SLIDE:
+            return max(1, slide_index - 1)
+    except Exception:
+        return None
+
+    return None
 
 
 def build_slide_id_to_index(prs: Presentation) -> dict[int, int]:
-    mapping = {}
-    for idx, slide in enumerate(prs.slides, start=1):
-        mapping[slide.slide_id] = idx
-    return mapping
+    out = {}
+    for i, slide in enumerate(prs.slides, start=1):
+        out[slide.slide_id] = i
+    return out
 
 
-def resolve_relative_target(current_idx: int, target_marker: int, total_slides: int) -> int | None:
-    if target_marker == -1:
-        return 1
-    if target_marker == -2:
-        return total_slides
-    if target_marker == -3:
-        return min(total_slides, current_idx + 1)
-    if target_marker == -4:
-        return max(1, current_idx - 1)
-    return None
+def is_supported_autoshape(shape) -> bool:
+    try:
+        if shape.shape_type != MSO_SHAPE_TYPE.AUTO_SHAPE:
+            return False
+
+        supported = {
+            MSO_AUTO_SHAPE_TYPE.RECTANGLE,
+            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+            MSO_AUTO_SHAPE_TYPE.OVAL,
+            MSO_AUTO_SHAPE_TYPE.DIAMOND,
+            MSO_AUTO_SHAPE_TYPE.ISOSCELES_TRIANGLE,
+            MSO_AUTO_SHAPE_TYPE.RIGHT_TRIANGLE,
+            MSO_AUTO_SHAPE_TYPE.HEXAGON,
+            MSO_AUTO_SHAPE_TYPE.PENTAGON,
+            MSO_AUTO_SHAPE_TYPE.OCTAGON,
+            MSO_AUTO_SHAPE_TYPE.PARALLELOGRAM,
+            MSO_AUTO_SHAPE_TYPE.TRAPEZOID,
+        }
+        return shape.auto_shape_type in supported
+    except Exception:
+        return False
 
 
-def extract_internal_hotspots(prs: Presentation) -> list[dict]:
+def autoshape_clip_path(shape) -> Optional[str]:
+    try:
+        t = shape.auto_shape_type
+        mapping = {
+            MSO_AUTO_SHAPE_TYPE.RECTANGLE: None,
+            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE: None,
+            MSO_AUTO_SHAPE_TYPE.OVAL: "ellipse(50% 50% at 50% 50%)",
+            MSO_AUTO_SHAPE_TYPE.DIAMOND: "polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)",
+            MSO_AUTO_SHAPE_TYPE.ISOSCELES_TRIANGLE: "polygon(50% 0%, 100% 100%, 0% 100%)",
+            MSO_AUTO_SHAPE_TYPE.RIGHT_TRIANGLE: "polygon(0% 0%, 100% 100%, 0% 100%)",
+            MSO_AUTO_SHAPE_TYPE.HEXAGON: "polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%)",
+            MSO_AUTO_SHAPE_TYPE.PENTAGON: "polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%)",
+            MSO_AUTO_SHAPE_TYPE.OCTAGON: "polygon(30% 0%, 70% 0%, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0% 70%, 0% 30%)",
+            MSO_AUTO_SHAPE_TYPE.PARALLELOGRAM: "polygon(18% 0%, 100% 0%, 82% 100%, 0% 100%)",
+            MSO_AUTO_SHAPE_TYPE.TRAPEZOID: "polygon(20% 0%, 80% 0%, 100% 100%, 0% 100%)",
+        }
+        return mapping.get(t)
+    except Exception:
+        return None
+
+
+# =========================
+# Rendering helpers
+# =========================
+def render_text_frame_html(shape) -> str:
+    tf = shape.text_frame
+    parts = []
+
+    margin_left = emu_to_px(getattr(tf, "margin_left", 0))
+    margin_right = emu_to_px(getattr(tf, "margin_right", 0))
+    margin_top = emu_to_px(getattr(tf, "margin_top", 0))
+    margin_bottom = emu_to_px(getattr(tf, "margin_bottom", 0))
+
+    style_outer = [
+        "position:absolute",
+        "inset:0",
+        f"padding:{margin_top:.2f}px {margin_right:.2f}px {margin_bottom:.2f}px {margin_left:.2f}px",
+        "overflow:hidden",
+        "display:flex",
+        "flex-direction:column",
+        "justify-content:flex-start",
+        "white-space:normal",
+        "word-break:break-word",
+    ]
+
+    parts.append(f'<div style="{";".join(style_outer)}">')
+
+    for para in tf.paragraphs:
+        align_css = "left"
+        try:
+            # 1 left, 2 center, 3 right, 4 justify, etc.
+            if para.alignment == 2:
+                align_css = "center"
+            elif para.alignment == 3:
+                align_css = "right"
+            elif para.alignment == 4:
+                align_css = "justify"
+        except Exception:
+            pass
+
+        para_html = []
+
+        if not para.runs and para.text:
+            para_html.append(html_text(para.text))
+
+        for run in para.runs:
+            text = html_text(run.text or "")
+            font = run.font
+
+            style = []
+            size = None
+            try:
+                if font.size:
+                    size = font.size.pt
+            except Exception:
+                size = None
+            if size is None:
+                size = 18
+            style.append(f"font-size:{size:.2f}px")
+
+            try:
+                if font.name:
+                    style.append(f'font-family:"{css_escape(font.name)}", Arial, sans-serif')
+            except Exception:
+                style.append('font-family:Arial, sans-serif')
+
+            try:
+                if font.bold:
+                    style.append("font-weight:700")
+            except Exception:
+                pass
+
+            try:
+                if font.italic:
+                    style.append("font-style:italic")
+            except Exception:
+                pass
+
+            deco = []
+            try:
+                if font.underline:
+                    deco.append("underline")
+            except Exception:
+                pass
+            if deco:
+                style.append(f"text-decoration:{' '.join(deco)}")
+
+            try:
+                color = rgb_to_css(font.color.rgb)
+                if color:
+                    style.append(f"color:{color}")
+            except Exception:
+                pass
+
+            para_html.append(f'<span style="{";".join(style)}">{text}</span>')
+
+        parts.append(
+            f'<div style="margin:0; text-align:{align_css}; line-height:1.2;">{"".join(para_html) or "&nbsp;"}</div>'
+        )
+
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def render_picture_html(shape) -> str:
+    image = shape.image
+    ext = getattr(image, "ext", "png")
+    data_uri = blob_to_data_uri(image.blob, ext)
+
+    crop_left = getattr(shape, "crop_left", 0.0) or 0.0
+    crop_right = getattr(shape, "crop_right", 0.0) or 0.0
+    crop_top = getattr(shape, "crop_top", 0.0) or 0.0
+    crop_bottom = getattr(shape, "crop_bottom", 0.0) or 0.0
+
+    # Approximation of PPT crop using enlarged image with negative offsets
+    visible_w = max(0.001, 1.0 - crop_left - crop_right)
+    visible_h = max(0.001, 1.0 - crop_top - crop_bottom)
+
+    img_w_pct = 100.0 / visible_w
+    img_h_pct = 100.0 / visible_h
+    left_pct = -(crop_left / visible_w) * 100.0
+    top_pct = -(crop_top / visible_h) * 100.0
+
+    return (
+        '<div style="position:absolute; inset:0; overflow:hidden;">'
+        f'<img src="{data_uri}" alt="" '
+        f'style="position:absolute; left:{left_pct:.4f}%; top:{top_pct:.4f}%; width:{img_w_pct:.4f}%; height:{img_h_pct:.4f}%; object-fit:fill; user-select:none; -webkit-user-drag:none;">'
+        "</div>"
+    )
+
+
+def render_autoshape_html(shape) -> str:
+    fill = get_solid_fill_css(shape)
+    line_color, line_width = get_line_css(shape)
+    clip = autoshape_clip_path(shape)
+
+    style = [
+        "position:absolute",
+        "inset:0",
+    ]
+
+    if fill:
+        style.append(f"background:{fill}")
+    else:
+        style.append("background:transparent")
+
+    if line_color and line_width and line_width > 0:
+        style.append(f"border:{line_width:.2f}px solid {line_color}")
+    else:
+        style.append("border:none")
+
+    if clip:
+        style.append(f"clip-path:{clip}")
+
+    # Rounded rectangle approximation
+    try:
+        if shape.auto_shape_type == MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE:
+            style.append("border-radius:12px")
+    except Exception:
+        pass
+
+    return f'<div style="{";".join(style)}"></div>'
+
+
+def render_shape_box(shape, inner_html: str, click_target: Optional[int]) -> str:
+    x = emu_to_px(shape.left)
+    y = emu_to_px(shape.top)
+    w = emu_to_px(shape.width)
+    h = emu_to_px(shape.height)
+    rot = get_rotation_deg(shape)
+
+    style = [
+        "position:absolute",
+        f"left:{x:.2f}px",
+        f"top:{y:.2f}px",
+        f"width:{w:.2f}px",
+        f"height:{h:.2f}px",
+        f"transform:rotate({rot:.4f}deg)",
+        "transform-origin:center center",
+        "box-sizing:border-box",
+    ]
+
+    clickable_overlay = ""
+    if click_target:
+        clickable_overlay = (
+            f'<button class="hotspot-btn" type="button" aria-label="Go to slide {click_target}" '
+            f'onclick="goToSlide({click_target})" '
+            'style="position:absolute; inset:0; background:transparent; border:none; cursor:pointer; padding:0; margin:0;"></button>'
+        )
+
+    return f'<div style="{";".join(style)}">{inner_html}{clickable_overlay}</div>'
+
+
+# =========================
+# PPT parsing
+# =========================
+def parse_ppt(prs: Presentation):
     slide_id_to_index = build_slide_id_to_index(prs)
     total_slides = len(prs.slides)
-    slides_data = []
 
-    for slide_idx, slide in enumerate(prs.slides, start=1):
-        hotspots = []
+    slides_out = []
+    warnings = []
+
+    for slide_index, slide in enumerate(prs.slides, start=1):
+        slide_items = []
 
         for shape in slide.shapes:
             try:
-                has_jump, target = shape_has_internal_jump(shape)
-                if not has_jump:
+                click_target = get_shape_action_target(shape, slide_index, total_slides, slide_id_to_index)
+                stype = shape.shape_type
+
+                if stype == MSO_SHAPE_TYPE.PICTURE:
+                    html_block = render_shape_box(shape, render_picture_html(shape), click_target)
+                    slide_items.append(html_block)
                     continue
 
-                target_index = None
-                if target in slide_id_to_index:
-                    target_index = slide_id_to_index[target]
-                else:
-                    target_index = resolve_relative_target(slide_idx, target, total_slides)
-
-                if not target_index:
+                if stype == MSO_SHAPE_TYPE.TEXT_BOX:
+                    html_block = render_shape_box(shape, render_text_frame_html(shape), click_target)
+                    slide_items.append(html_block)
                     continue
 
-                x = px_from_emu(shape.left)
-                y = px_from_emu(shape.top)
-                w = px_from_emu(shape.width)
-                h = px_from_emu(shape.height)
+                if stype == MSO_SHAPE_TYPE.AUTO_SHAPE:
+                    inner = []
 
-                if w <= 1 or h <= 1:
+                    if is_supported_autoshape(shape):
+                        inner.append(render_autoshape_html(shape))
+                    else:
+                        warnings.append(
+                            f"Slide {slide_index}: unsupported AutoShape '{getattr(shape, 'name', 'Unnamed')}'"
+                        )
+                        continue
+
+                    if getattr(shape, "has_text_frame", False) and shape.text_frame and shape.text_frame.text:
+                        inner.append(render_text_frame_html(shape))
+
+                    html_block = render_shape_box(shape, "".join(inner), click_target)
+                    slide_items.append(html_block)
                     continue
 
-                hotspots.append(
-                    {
-                        "x": round(x, 2),
-                        "y": round(y, 2),
-                        "w": round(w, 2),
-                        "h": round(h, 2),
-                        "target": target_index,
-                    }
-                )
+                if getattr(shape, "has_text_frame", False) and shape.text_frame and shape.text_frame.text:
+                    html_block = render_shape_box(shape, render_text_frame_html(shape), click_target)
+                    slide_items.append(html_block)
+                    warnings.append(
+                        f"Slide {slide_index}: approximated text-bearing shape '{getattr(shape, 'name', 'Unnamed')}'"
+                    )
+                    continue
 
-            except Exception:
-                continue
+                if stype == MSO_SHAPE_TYPE.GROUP:
+                    warnings.append(f"Slide {slide_index}: unsupported grouped shape '{getattr(shape, 'name', 'Unnamed')}'")
+                    continue
 
-        slides_data.append({"slide": slide_idx, "hotspots": hotspots})
+                if stype == MSO_SHAPE_TYPE.CHART:
+                    warnings.append(f"Slide {slide_index}: unsupported chart '{getattr(shape, 'name', 'Unnamed')}'")
+                    continue
 
-    return slides_data
+                if stype == MSO_SHAPE_TYPE.TABLE:
+                    warnings.append(f"Slide {slide_index}: unsupported table '{getattr(shape, 'name', 'Unnamed')}'")
+                    continue
 
+                if stype == MSO_SHAPE_TYPE.SMART_ART:
+                    warnings.append(f"Slide {slide_index}: unsupported SmartArt '{getattr(shape, 'name', 'Unnamed')}'")
+                    continue
 
-def find_libreoffice() -> str | None:
-    candidates = [
-        shutil.which("soffice"),
-        shutil.which("libreoffice"),
-        r"C:\Program Files\LibreOffice\program\soffice.exe",
-        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    return None
+                warnings.append(f"Slide {slide_index}: unsupported shape type '{stype}' in '{getattr(shape, 'name', 'Unnamed')}'")
 
+            except Exception as e:
+                warnings.append(f"Slide {slide_index}: failed to render '{getattr(shape, 'name', 'Unnamed')}' ({e})")
 
-def export_slides_with_powerpoint_windows(pptx_path: str, out_dir: str) -> bool:
-    """
-    Best rendering on Windows if PowerPoint is installed.
-    Exports each slide as PNG.
-    """
-    try:
-        import win32com.client  # type: ignore
-    except Exception:
-        return False
+        slides_out.append(slide_items)
 
-    powerpoint = None
-    presentation = None
-    try:
-        powerpoint = win32com.client.Dispatch("PowerPoint.Application")
-        powerpoint.Visible = 1
-        presentation = powerpoint.Presentations.Open(os.path.abspath(pptx_path), WithWindow=False)
-        presentation.Export(os.path.abspath(out_dir), "PNG")
-        return True
-    except Exception:
-        return False
-    finally:
-        try:
-            if presentation is not None:
-                presentation.Close()
-        except Exception:
-            pass
-        try:
-            if powerpoint is not None:
-                powerpoint.Quit()
-        except Exception:
-            pass
+    return slides_out, warnings
 
 
-def export_slides_with_libreoffice(pptx_path: str, out_dir: str) -> bool:
-    soffice = find_libreoffice()
-    if not soffice:
-        return False
-
-    try:
-        subprocess.run(
-            [
-                soffice,
-                "--headless",
-                "--convert-to",
-                "png",
-                "--outdir",
-                out_dir,
-                pptx_path,
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except Exception:
-        return False
-
-    # LibreOffice often exports the whole deck as multiple slide PNGs into the folder.
-    # Some systems may instead create a single file or use naming patterns.
-    pngs = list(Path(out_dir).glob("*.png"))
-    return len(pngs) > 0
-
-
-def collect_exported_slide_images(export_dir: str, expected_count: int) -> list[Path]:
-    """
-    Tries to sort exported PNGs into slide order.
-    """
-    pngs = list(Path(export_dir).glob("*.png"))
-    if not pngs:
-        return []
-
-    def slide_sort_key(path: Path):
-        name = path.stem.lower()
-        nums = re.findall(r"\d+", name)
-        if nums:
-            return int(nums[-1])
-        return 10**9
-
-    pngs = sorted(pngs, key=slide_sort_key)
-
-    # If count matches, great
-    if len(pngs) >= expected_count:
-        return pngs[:expected_count]
-
-    return pngs
-
-
-def export_slide_images(pptx_path: str, work_dir: str, expected_count: int) -> list[Path]:
-    """
-    Priority:
-    1. Windows PowerPoint COM export for best fidelity
-    2. LibreOffice export
-    """
-    export_dir = os.path.join(work_dir, "slide_exports")
-    os.makedirs(export_dir, exist_ok=True)
-
-    ok = export_slides_with_powerpoint_windows(pptx_path, export_dir)
-    if not ok:
-        ok = export_slides_with_libreoffice(pptx_path, export_dir)
-
-    if not ok:
-        raise RuntimeError(
-            "Could not export slide images. Install Microsoft PowerPoint on Windows "
-            "or LibreOffice for headless export."
+# =========================
+# HTML + SCORM generation
+# =========================
+def build_player_html(course_title: str, width_px: int, height_px: int, slides_items: list[list[str]]) -> str:
+    slides_html = []
+    for i, items in enumerate(slides_items, start=1):
+        content = "".join(items)
+        slides_html.append(
+            f'<div class="slide" id="slide-{i}" data-slide-index="{i}" style="display:none;">{content}</div>'
         )
 
-    images = collect_exported_slide_images(export_dir, expected_count)
-    if not images:
-        raise RuntimeError("Slide image export finished, but no PNG slide images were found.")
-
-    return images
-
-
-def image_to_base64(path: Path) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def write_text(path: str, content: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-def build_player_html(
-    title: str,
-    slide_width_px: int,
-    slide_height_px: int,
-    image_files: list[str],
-    hotspots_by_slide: list[dict],
-) -> str:
-    images_json = json.dumps(image_files)
-    hotspots_json = json.dumps(hotspots_by_slide)
-
-    safe_title = html.escape(title)
+    slides_joined = "".join(slides_html)
+    aspect = width_px / height_px
 
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{safe_title}</title>
+  <title>{html.escape(course_title)}</title>
   <style>
     :root {{
       --bg: #111;
       --panel: #1b1b1b;
+      --btn: #2a2a2a;
+      --btn-hover: #383838;
       --text: #fff;
-      --muted: #ccc;
-      --btn: #2b2b2b;
-      --btn-hover: #3a3a3a;
-      --accent: #4da3ff;
     }}
 
     * {{
@@ -308,10 +494,10 @@ def build_player_html(
     }}
 
     html, body {{
-      margin: 0;
-      padding: 0;
       width: 100%;
       height: 100%;
+      margin: 0;
+      padding: 0;
       background: var(--bg);
       color: var(--text);
       font-family: Arial, Helvetica, sans-serif;
@@ -319,20 +505,20 @@ def build_player_html(
     }}
 
     .app {{
-      display: flex;
-      flex-direction: column;
       width: 100%;
       height: 100%;
+      display: flex;
+      flex-direction: column;
     }}
 
     .topbar {{
       flex: 0 0 auto;
       display: flex;
-      align-items: center;
       justify-content: center;
+      align-items: center;
       gap: 12px;
-      padding: 14px 18px;
-      background: rgba(0,0,0,0.45);
+      padding: 14px 16px;
+      background: rgba(0,0,0,0.4);
       border-bottom: 1px solid rgba(255,255,255,0.08);
       z-index: 10;
     }}
@@ -357,15 +543,14 @@ def build_player_html(
       cursor: not-allowed;
     }}
 
-    .slide-count {{
+    .counter {{
+      min-width: 140px;
+      text-align: center;
       font-size: 20px;
       font-weight: 700;
-      letter-spacing: 0.02em;
-      min-width: 150px;
-      text-align: center;
     }}
 
-    .stage-wrap {{
+    .viewport {{
       flex: 1 1 auto;
       min-height: 0;
       display: flex;
@@ -376,38 +561,27 @@ def build_player_html(
 
     .stage {{
       position: relative;
-      width: min(calc(100vw - 36px), calc((100vh - 110px) * {slide_width_px / slide_height_px:.8f}));
-      aspect-ratio: {slide_width_px} / {slide_height_px};
-      max-height: calc(100vh - 110px);
-      background: #000;
+      width: min(calc(100vw - 36px), calc((100vh - 100px) * {aspect:.10f}));
+      aspect-ratio: {width_px} / {height_px};
+      max-height: calc(100vh - 100px);
+      background: white;
       overflow: hidden;
       border-radius: 8px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+      box-shadow: 0 10px 28px rgba(0,0,0,0.35);
     }}
 
-    .slide-image {{
+    .slide {{
       position: absolute;
       inset: 0;
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      display: block;
-      user-select: none;
-      -webkit-user-drag: none;
+      width: {width_px}px;
+      height: {height_px}px;
+      transform-origin: top left;
+      background: white;
+      overflow: hidden;
     }}
 
-    .hotspot {{
-      position: absolute;
-      background: transparent;
-      border: none;
-      outline: none;
-      cursor: pointer;
-      padding: 0;
-      margin: 0;
-    }}
-
-    .hotspot:focus {{
-      outline: 2px solid rgba(77,163,255,0.7);
+    .hotspot-btn:focus {{
+      outline: 2px solid rgba(0,120,255,0.75);
       outline-offset: -2px;
     }}
   </style>
@@ -416,94 +590,83 @@ def build_player_html(
   <div class="app">
     <div class="topbar">
       <button id="prevBtn" type="button">◀ Prev</button>
-      <div id="slideCount" class="slide-count">1 / 1</div>
+      <div id="counter" class="counter">1 / 1</div>
       <button id="nextBtn" type="button">Next ▶</button>
     </div>
 
-    <div class="stage-wrap">
+    <div class="viewport">
       <div id="stage" class="stage">
-        <img id="slideImage" class="slide-image" alt="Slide">
+        {slides_joined}
       </div>
     </div>
   </div>
 
   <script>
-    const images = {images_json};
-    const hotspotsBySlide = {hotspots_json};
-    const slideWidth = {slide_width_px};
-    const slideHeight = {slide_height_px};
+    const TOTAL = {len(slides_items)};
+    const BASE_W = {width_px};
+    const BASE_H = {height_px};
+    let current = 1;
 
-    let current = 0;
-
-    const slideImage = document.getElementById("slideImage");
     const stage = document.getElementById("stage");
-    const slideCount = document.getElementById("slideCount");
+    const counter = document.getElementById("counter");
     const prevBtn = document.getElementById("prevBtn");
     const nextBtn = document.getElementById("nextBtn");
 
-    function clamp(n, min, max) {{
-      return Math.max(min, Math.min(max, n));
+    function updateScale() {{
+      const w = stage.clientWidth;
+      const h = stage.clientHeight;
+      const scale = Math.min(w / BASE_W, h / BASE_H);
+
+      document.querySelectorAll(".slide").forEach(slide => {{
+        slide.style.transform = `scale(${{scale}})`;
+      }});
     }}
 
     function render() {{
-      current = clamp(current, 0, images.length - 1);
-      slideImage.src = images[current];
-      slideCount.textContent = `${{current + 1}} / ${{images.length}}`;
-      prevBtn.disabled = current === 0;
-      nextBtn.disabled = current === images.length - 1;
+      current = Math.max(1, Math.min(TOTAL, current));
+      document.querySelectorAll(".slide").forEach(slide => {{
+        slide.style.display = "none";
+      }});
+      const active = document.getElementById(`slide-${{current}}`);
+      if (active) active.style.display = "block";
 
-      [...stage.querySelectorAll(".hotspot")].forEach(el => el.remove());
+      counter.textContent = `${{current}} / ${{TOTAL}}`;
+      prevBtn.disabled = current === 1;
+      nextBtn.disabled = current === TOTAL;
 
-      const entry = hotspotsBySlide.find(s => s.slide === current + 1);
-      if (!entry || !entry.hotspots) return;
-
-      for (const h of entry.hotspots) {{
-        const btn = document.createElement("button");
-        btn.className = "hotspot";
-        btn.type = "button";
-        btn.setAttribute("aria-label", `Go to slide ${{h.target}}`);
-
-        btn.style.left = `${{(h.x / slideWidth) * 100}}%`;
-        btn.style.top = `${{(h.y / slideHeight) * 100}}%`;
-        btn.style.width = `${{(h.w / slideWidth) * 100}}%`;
-        btn.style.height = `${{(h.h / slideHeight) * 100}}%`;
-
-        btn.addEventListener("click", () => {{
-          current = h.target - 1;
-          render();
-        }});
-
-        stage.appendChild(btn);
-      }}
+      updateScale();
     }}
 
-    prevBtn.addEventListener("click", () => {{
-      if (current > 0) {{
+    function goToSlide(n) {{
+      current = n;
+      render();
+    }}
+
+    prevBtn.addEventListener("click", function() {{
+      if (current > 1) {{
         current -= 1;
         render();
       }}
     }});
 
-    nextBtn.addEventListener("click", () => {{
-      if (current < images.length - 1) {{
+    nextBtn.addEventListener("click", function() {{
+      if (current < TOTAL) {{
         current += 1;
         render();
       }}
     }});
 
-    document.addEventListener("keydown", (e) => {{
-      if (e.key === "ArrowLeft") {{
-        if (current > 0) {{
-          current -= 1;
-          render();
-        }}
-      }} else if (e.key === "ArrowRight") {{
-        if (current < images.length - 1) {{
-          current += 1;
-          render();
-        }}
+    document.addEventListener("keydown", function(e) {{
+      if (e.key === "ArrowLeft" && current > 1) {{
+        current -= 1;
+        render();
+      }} else if (e.key === "ArrowRight" && current < TOTAL) {{
+        current += 1;
+        render();
       }}
     }});
+
+    window.addEventListener("resize", updateScale);
 
     render();
   </script>
@@ -513,8 +676,7 @@ def build_player_html(
 
 
 def build_scorm_api_js() -> str:
-    return r"""
-var scormData = {
+    return """var scormData = {
   "cmi.core.lesson_status": "not attempted",
   "cmi.core.score.raw": "",
   "cmi.core.student_name": "Learner",
@@ -523,13 +685,8 @@ var scormData = {
 
 function LMSInitialize(param) { return "true"; }
 function LMSFinish(param) { return "true"; }
-function LMSGetValue(key) {
-  return scormData[key] || "";
-}
-function LMSSetValue(key, value) {
-  scormData[key] = value;
-  return "true";
-}
+function LMSGetValue(key) { return scormData[key] || ""; }
+function LMSSetValue(key, value) { scormData[key] = value; return "true"; }
 function LMSCommit(param) { return "true"; }
 function LMSGetLastError() { return "0"; }
 function LMSGetErrorString(code) { return "No error"; }
@@ -548,7 +705,7 @@ var API = {
 """
 
 
-def build_scorm_launcher_html(course_title: str) -> str:
+def build_index_html(course_title: str) -> str:
     safe_title = html.escape(course_title)
     return f"""<!doctype html>
 <html lang="en">
@@ -571,7 +728,7 @@ def build_scorm_launcher_html(course_title: str) -> str:
         API.LMSCommit("");
         API.LMSFinish("");
       }} catch (e) {{}}
-    };
+    }};
   </script>
 </head>
 <frameset rows="100%" border="0">
@@ -582,8 +739,8 @@ def build_scorm_launcher_html(course_title: str) -> str:
 
 
 def build_manifest_xml(course_id: str, course_title: str) -> str:
-    safe_title = html.escape(course_title)
     safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", course_id)
+    safe_title = html.escape(course_title)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <manifest identifier="{safe_id}"
@@ -598,7 +755,6 @@ def build_manifest_xml(course_id: str, course_title: str) -> str:
     <schema>ADL SCORM</schema>
     <schemaversion>1.2</schemaversion>
   </metadata>
-
   <organizations default="ORG1">
     <organization identifier="ORG1">
       <title>{safe_title}</title>
@@ -607,7 +763,6 @@ def build_manifest_xml(course_id: str, course_title: str) -> str:
       </item>
     </organization>
   </organizations>
-
   <resources>
     <resource identifier="RES1"
               type="webcontent"
@@ -622,87 +777,82 @@ def build_manifest_xml(course_id: str, course_title: str) -> str:
 """
 
 
-def create_scorm_package(uploaded_file, course_title: str) -> bytes:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        pptx_path = tmpdir_path / "input.pptx"
+def create_package(uploaded_file, course_title: str) -> tuple[bytes, list[str], str]:
+    pptx_bytes = uploaded_file.getvalue()
+    prs = Presentation(io.BytesIO(pptx_bytes))
 
-        with open(pptx_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+    width_px = int(round(emu_to_px(prs.slide_width)))
+    height_px = int(round(emu_to_px(prs.slide_height)))
 
-        prs = Presentation(str(pptx_path))
-        slide_width_px = int(round(px_from_emu(prs.slide_width)))
-        slide_height_px = int(round(px_from_emu(prs.slide_height)))
-        hotspots = extract_internal_hotspots(prs)
+    slides_items, warnings = parse_ppt(prs)
 
-        exported_images = export_slide_images(str(pptx_path), tmpdir, len(prs.slides))
+    player_html = build_player_html(course_title, width_px, height_px, slides_items)
+    index_html = build_index_html(course_title)
+    scorm_js = build_scorm_api_js()
+    manifest_xml = build_manifest_xml("ppt_html_scorm_course", course_title)
 
-        package_dir = tmpdir_path / "scorm_package"
-        assets_dir = package_dir / "assets"
-        assets_dir.mkdir(parents=True, exist_ok=True)
+    html_preview = player_html
 
-        image_files = []
-        for idx, src in enumerate(exported_images, start=1):
-            ext = src.suffix.lower() or ".png"
-            dst_name = f"slide_{idx:03d}{ext}"
-            dst = assets_dir / dst_name
-            shutil.copy2(src, dst)
-            image_files.append(f"assets/{dst_name}")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("player.html", player_html)
+        zf.writestr("index.html", index_html)
+        zf.writestr("scorm_api.js", scorm_js)
+        zf.writestr("imsmanifest.xml", manifest_xml)
 
-        player_html = build_player_html(
-            title=course_title,
-            slide_width_px=slide_width_px,
-            slide_height_px=slide_height_px,
-            image_files=image_files,
-            hotspots_by_slide=hotspots,
-        )
-
-        write_text(str(package_dir / "player.html"), player_html)
-        write_text(str(package_dir / "scorm_api.js"), build_scorm_api_js())
-        write_text(str(package_dir / "index.html"), build_scorm_launcher_html(course_title))
-        write_text(str(package_dir / "imsmanifest.xml"), build_manifest_xml("ppt_to_scorm_course", course_title))
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(package_dir):
-                for file in files:
-                    abs_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(abs_path, package_dir)
-                    zf.write(abs_path, rel_path)
-
-        zip_buffer.seek(0)
-        return zip_buffer.read()
+    buf.seek(0)
+    return buf.read(), warnings, html_preview
 
 
 # =========================
 # UI
 # =========================
 uploaded = st.file_uploader("Upload PowerPoint (.pptx)", type=["pptx"])
-default_name = "ppt_scorm_package"
 
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([1, 1])
 with col1:
-    package_name = st.text_input("Package name", value=default_name)
+    package_name = st.text_input("Package name", value="ppt_html_scorm")
 with col2:
     course_title = st.text_input("Course title", value="PPT Course")
 
-st.caption("Best fidelity is on Windows with Microsoft PowerPoint installed. LibreOffice is used as fallback.")
+st.markdown(
+    """
+This version is built to be **stable on Streamlit**.
+
+It supports a controlled subset of PowerPoint features:
+text boxes, pictures, simple shapes, basic fills/outlines, and internal slide links.
+"""
+)
 
 if uploaded is not None:
     st.success(f"Loaded: {uploaded.name}")
 
-    if st.button("Publish SCORM package", type="primary"):
+    if st.button("Generate HTML + SCORM", type="primary"):
         try:
-            output_bytes = create_scorm_package(uploaded, course_title=course_title.strip() or "PPT Course")
+            zip_bytes, warnings, preview_html = create_package(
+                uploaded,
+                course_title.strip() or "PPT Course"
+            )
+
             safe_name = sanitize_filename(package_name) + ".zip"
 
-            st.success("SCORM package created successfully.")
+            st.success("Package created.")
             st.download_button(
                 label="Download SCORM ZIP",
-                data=output_bytes,
+                data=zip_bytes,
                 file_name=safe_name,
                 mime="application/zip",
             )
 
+            with st.expander("Preview rendered HTML", expanded=True):
+                st.components.v1.html(preview_html, height=720, scrolling=False)
+
+            if warnings:
+                with st.expander("Unsupported or approximated items", expanded=False):
+                    for w in warnings:
+                        st.write(f"- {w}")
+            else:
+                st.info("No unsupported items detected.")
+
         except Exception as e:
-            st.error(f"Failed to publish SCORM package: {e}")
+            st.error(f"Failed to generate package: {e}")
