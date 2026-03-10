@@ -92,7 +92,7 @@ def emu_to_px(value: float, scale: float) -> int:
     return int(round(value * scale))
 
 
-def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
+def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
     words = text.split()
     if not words:
         return []
@@ -111,26 +111,133 @@ def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -
 
 
 def get_font(size_px: int, bold: bool = False):
-    candidates = []
-    if bold:
-        candidates = [
-            "arialbd.ttf",
-            "Arial Bold.ttf",
-            "DejaVuSans-Bold.ttf",
-        ]
-    else:
-        candidates = [
-            "arial.ttf",
-            "Arial.ttf",
-            "DejaVuSans.ttf",
-        ]
-
+    candidates = (
+        ["arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"]
+        if bold
+        else ["arial.ttf", "Arial.ttf", "DejaVuSans.ttf"]
+    )
     for name in candidates:
         try:
             return ImageFont.truetype(name, size_px)
         except Exception:
             continue
     return ImageFont.load_default()
+
+
+# ============================================================
+# XML / image helpers
+# ============================================================
+
+def local_name(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def find_descendant_by_localname(el, name: str):
+    for node in el.iter():
+        if local_name(node.tag) == name:
+            return node
+    return None
+
+
+def find_descendants_by_localname(el, name: str):
+    out = []
+    for node in el.iter():
+        if local_name(node.tag) == name:
+            out.append(node)
+    return out
+
+
+def get_crop_rect_from_shape(shape) -> Tuple[float, float, float, float]:
+    """
+    Returns crop fractions (left, top, right, bottom) in range 0..1
+    """
+    try:
+        src_rect = find_descendant_by_localname(shape.element, "srcRect")
+        if src_rect is None:
+            return 0.0, 0.0, 0.0, 0.0
+
+        l = float(src_rect.get("l", "0")) / 100000.0
+        t = float(src_rect.get("t", "0")) / 100000.0
+        r = float(src_rect.get("r", "0")) / 100000.0
+        b = float(src_rect.get("b", "0")) / 100000.0
+        return l, t, r, b
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0
+
+
+def apply_crop_to_image(img: Image.Image, crop_rect: Tuple[float, float, float, float]) -> Image.Image:
+    l, t, r, b = crop_rect
+    if max(l, t, r, b) <= 0:
+        return img
+
+    w, h = img.size
+    left = int(round(w * l))
+    top = int(round(h * t))
+    right = int(round(w * (1 - r)))
+    bottom = int(round(h * (1 - b)))
+
+    left = max(0, min(left, w - 1))
+    top = max(0, min(top, h - 1))
+    right = max(left + 1, min(right, w))
+    bottom = max(top + 1, min(bottom, h))
+
+    return img.crop((left, top, right, bottom))
+
+
+def get_image_blob_from_rid(shape_part, rid: str) -> Optional[bytes]:
+    try:
+        rel = shape_part.related_part(rid)
+        blob = getattr(rel, "blob", None)
+        if blob:
+            return blob
+    except Exception:
+        pass
+    return None
+
+
+def get_shape_fill_image_blob(shape) -> Optional[bytes]:
+    try:
+        blip = find_descendant_by_localname(shape.element, "blip")
+        if blip is None:
+            return None
+
+        rid = None
+        for k, v in blip.attrib.items():
+            if k.endswith("embed"):
+                rid = v
+                break
+        if not rid:
+            return None
+
+        return get_image_blob_from_rid(shape.part, rid)
+    except Exception:
+        return None
+
+
+def get_slide_background_image_blob(slide) -> Optional[bytes]:
+    try:
+        bg = slide.background
+        fill = getattr(bg, "fill", None)
+        _ = fill  # keep for sanity, not strictly needed
+    except Exception:
+        pass
+
+    try:
+        blip = find_descendant_by_localname(slide._element, "blip")
+        if blip is None:
+            return None
+
+        rid = None
+        for k, v in blip.attrib.items():
+            if k.endswith("embed"):
+                rid = v
+                break
+        if not rid:
+            return None
+
+        return get_image_blob_from_rid(slide.part, rid)
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -164,9 +271,9 @@ def detect_internal_link_target(slides, slide_idx_zero: int, shape) -> Optional[
         pass
 
     try:
-        hlink_click = shape.element.xpath(".//*[local-name()='hlinkClick']")
-        if hlink_click:
-            action = (hlink_click[0].get("action") or "").lower()
+        hlink_click = find_descendant_by_localname(shape.element, "hlinkClick")
+        if hlink_click is not None:
+            action = (hlink_click.get("action") or "").lower()
             if "firstslide" in action:
                 return 1
             if "lastslide" in action:
@@ -464,9 +571,17 @@ def draw_shape_object(draw, shape, scale: float, offset_x=0, offset_y=0):
         draw.polygon(pts, fill=fill, outline=outline)
         return
 
-    # fallback for unsupported shapes
     if auto is not None:
         draw_rect(draw, x, y, w, h, fill, outline, width, radius=0)
+
+
+def paste_image_into_box(canvas: Image.Image, img: Image.Image, x: int, y: int, w: int, h: int):
+    if w <= 0 or h <= 0:
+        return
+    img = img.resize((w, h))
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    canvas.alpha_composite(img, (x, y))
 
 
 def paste_picture(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y=0):
@@ -481,10 +596,40 @@ def paste_picture(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y
         h = max(1, emu_to_px(h_emu, scale))
 
         img = Image.open(io.BytesIO(image.blob)).convert("RGBA")
-        img = img.resize((w, h))
-        canvas.alpha_composite(img, (x, y))
+        img = apply_crop_to_image(img, get_crop_rect_from_shape(shape))
+        paste_image_into_box(canvas, img, x, y, w, h)
     except Exception:
         pass
+
+
+def paste_shape_fill_image(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y=0):
+    try:
+        blob = get_shape_fill_image_blob(shape)
+        if not blob:
+            return False
+        x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
+        x = emu_to_px(x_emu, scale)
+        y = emu_to_px(y_emu, scale)
+        w = max(1, emu_to_px(w_emu, scale))
+        h = max(1, emu_to_px(h_emu, scale))
+
+        img = Image.open(io.BytesIO(blob)).convert("RGBA")
+        paste_image_into_box(canvas, img, x, y, w, h)
+        return True
+    except Exception:
+        return False
+
+
+def paste_slide_background(canvas: Image.Image, slide, prs: Presentation):
+    try:
+        blob = get_slide_background_image_blob(slide)
+        if not blob:
+            return False
+        img = Image.open(io.BytesIO(blob)).convert("RGBA")
+        paste_image_into_box(canvas, img, 0, 0, canvas.width, canvas.height)
+        return True
+    except Exception:
+        return False
 
 
 def render_shape_recursive(canvas: Image.Image, draw: ImageDraw.ImageDraw, shape, scale: float, offset_x=0, offset_y=0):
@@ -498,6 +643,12 @@ def render_shape_recursive(canvas: Image.Image, draw: ImageDraw.ImageDraw, shape
         except Exception:
             pass
         return
+
+    used_fill_img = False
+    try:
+        used_fill_img = paste_shape_fill_image(canvas, shape, scale, offset_x, offset_y)
+    except Exception:
+        used_fill_img = False
 
     try:
         if getattr(shape, "image", None) is not None:
@@ -531,6 +682,8 @@ def render_slide_to_png(slide, prs: Presentation) -> bytes:
     canvas = Image.new("RGBA", (CANVAS_W, canvas_h), (255, 255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
+    paste_slide_background(canvas, slide, prs)
+
     for shape in slide.shapes:
         render_shape_recursive(canvas, draw, shape, scale)
 
@@ -540,7 +693,7 @@ def render_slide_to_png(slide, prs: Presentation) -> bytes:
 
 
 # ============================================================
-# Extract slide package data
+# Extract course package data
 # ============================================================
 
 def collect_hotspots_recursive(shape, prs, slide_idx_zero: int, hotspots: List[Dict[str, Any]], offset_x=0, offset_y=0):
@@ -596,7 +749,7 @@ def extract_course(prs: Presentation) -> Tuple[Dict[str, Any], Dict[str, bytes]]
 
 
 # ============================================================
-# SCORM / HTML player
+# SCORM / player
 # ============================================================
 
 def build_scorm_driver_js() -> str:
@@ -683,8 +836,11 @@ def build_manifest_xml(course_id: str, title: str, media_files: List[str]) -> st
 </manifest>"""
 
 
-def build_player_html(title: str, course: Dict[str, Any]) -> str:
+def build_player_html(title: str, course: Dict[str, Any], show_nav: bool) -> str:
     data = json.dumps(course, ensure_ascii=False)
+    sidebar_style = "" if show_nav else "display:none;"
+    bottombar_style = "display:flex;" if show_nav else "display:none;"
+    app_padding_left = "130px" if show_nav else "0"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -712,6 +868,7 @@ body {{
   background: #1a1a1a;
   border-right: 1px solid #333;
   padding: 16px 10px;
+  {sidebar_style}
 }}
 .sidebar label {{
   display: block;
@@ -773,17 +930,22 @@ body {{
   position: absolute;
   inset: 0;
 }}
-.hotspot-svg {{
-  width: 100%;
-  height: 100%;
+.hotspot {{
+  position: absolute;
+  display: block;
+  background: rgba(0,0,0,0);
+  pointer-events: auto;
+}}
+.hotspot.ellipse {{
+  border-radius: 50%;
 }}
 .bottom-bar {{
   background: #1a1a1a;
   border-top: 1px solid #333;
   padding: 12px 16px;
-  display: flex;
   justify-content: center;
   gap: 12px;
+  {bottombar_style}
 }}
 .bottom-bar button {{
   background: #262626;
@@ -828,7 +990,7 @@ body {{
       <button onclick="nextSlide()">Next</button>
     </div>
 
-    <div class="footer">Static slide image with clickable hotspots.</div>
+    <div class="footer">Static slide image with HTML hotspot overlays.</div>
   </div>
 </div>
 
@@ -847,6 +1009,7 @@ function pct(value, total) {{
 }}
 
 function populateJumpMenu() {{
+  if (!jumpSelect) return;
   jumpSelect.innerHTML = "";
   for (const slide of course.slides) {{
     const opt = document.createElement("option");
@@ -856,67 +1019,63 @@ function populateJumpMenu() {{
   }}
 }}
 
-function addHotspotAnchor(el, link) {{
+function createHotspot(link) {{
+  const a = document.createElement("a");
+  a.className = "hotspot";
+  a.href = "#";
+
   if (link.kind === "external" && link.url) {{
-    el.setAttribute("href", link.url);
-    el.setAttribute("target", "_blank");
-    el.setAttribute("rel", "noopener noreferrer");
+    a.href = link.url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
   }} else if (link.kind === "internal" && link.target_slide) {{
-    el.setAttribute("href", "#");
-    el.addEventListener("click", function(e) {{
+    a.addEventListener("click", function(e) {{
       e.preventDefault();
       goToSlide(Number(link.target_slide));
     }});
+  }} else {{
+    return null;
   }}
-  return el;
+
+  if (link.geom === "ellipse") {{
+    a.classList.add("ellipse");
+    a.style.left = pct(link.x, course.slideWidthEmu) + "%";
+    a.style.top = pct(link.y, course.slideHeightEmu) + "%";
+    a.style.width = pct(link.w, course.slideWidthEmu) + "%";
+    a.style.height = pct(link.h, course.slideHeightEmu) + "%";
+  }} else if (link.geom === "line") {{
+    const x1p = pct(link.x1, course.slideWidthEmu);
+    const y1p = pct(link.y1, course.slideHeightEmu);
+    const x2p = pct(link.x2, course.slideWidthEmu);
+    const y2p = pct(link.y2, course.slideHeightEmu);
+
+    const dx = x2p - x1p;
+    const dy = y2p - y1p;
+    const len = Math.sqrt(dx*dx + dy*dy);
+    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+
+    a.style.left = x1p + "%";
+    a.style.top = y1p + "%";
+    a.style.width = len + "%";
+    a.style.height = "2%";
+    a.style.transformOrigin = "0 50%";
+    a.style.transform = `translateY(-50%) rotate(${{angle}}deg)`;
+  }} else {{
+    a.style.left = pct(link.x, course.slideWidthEmu) + "%";
+    a.style.top = pct(link.y, course.slideHeightEmu) + "%";
+    a.style.width = pct(link.w, course.slideWidthEmu) + "%";
+    a.style.height = pct(link.h, course.slideHeightEmu) + "%";
+  }}
+
+  return a;
 }}
 
 function renderHotspots(slide) {{
   hotspotLayer.innerHTML = "";
-
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("class", "hotspot-svg");
-  svg.setAttribute("viewBox", "0 0 100 100");
-  svg.setAttribute("preserveAspectRatio", "none");
-
   for (const link of slide.hotspots || []) {{
-    const anchor = document.createElementNS("http://www.w3.org/2000/svg", "a");
-    addHotspotAnchor(anchor, link);
-
-    let shapeEl = null;
-
-    if (link.geom === "ellipse") {{
-      shapeEl = document.createElementNS("http://www.w3.org/2000/svg", "ellipse");
-      shapeEl.setAttribute("cx", pct(link.x + link.w / 2, course.slideWidthEmu));
-      shapeEl.setAttribute("cy", pct(link.y + link.h / 2, course.slideHeightEmu));
-      shapeEl.setAttribute("rx", pct(link.w / 2, course.slideWidthEmu));
-      shapeEl.setAttribute("ry", pct(link.h / 2, course.slideHeightEmu));
-      shapeEl.setAttribute("fill", "rgba(0,0,0,0)");
-      shapeEl.setAttribute("stroke", "rgba(0,0,0,0)");
-    }} else if (link.geom === "line") {{
-      shapeEl = document.createElementNS("http://www.w3.org/2000/svg", "line");
-      shapeEl.setAttribute("x1", pct(link.x1, course.slideWidthEmu));
-      shapeEl.setAttribute("y1", pct(link.y1, course.slideHeightEmu));
-      shapeEl.setAttribute("x2", pct(link.x2, course.slideWidthEmu));
-      shapeEl.setAttribute("y2", pct(link.y2, course.slideHeightEmu));
-      shapeEl.setAttribute("stroke", "rgba(0,0,0,0)");
-      shapeEl.setAttribute("stroke-width", "12");
-      shapeEl.setAttribute("pointer-events", "stroke");
-    }} else {{
-      shapeEl = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      shapeEl.setAttribute("x", pct(link.x, course.slideWidthEmu));
-      shapeEl.setAttribute("y", pct(link.y, course.slideHeightEmu));
-      shapeEl.setAttribute("width", pct(link.w, course.slideWidthEmu));
-      shapeEl.setAttribute("height", pct(link.h, course.slideHeightEmu));
-      shapeEl.setAttribute("fill", "rgba(0,0,0,0)");
-      shapeEl.setAttribute("stroke", "rgba(0,0,0,0)");
-    }}
-
-    anchor.appendChild(shapeEl);
-    svg.appendChild(anchor);
+    const el = createHotspot(link);
+    if (el) hotspotLayer.appendChild(el);
   }}
-
-  hotspotLayer.appendChild(svg);
 }}
 
 function setScormState() {{
@@ -938,7 +1097,7 @@ function goToSlide(num) {{
   renderHotspots(slide);
 
   counter.textContent = `Slide ${{currentSlide}} of ${{course.slides.length}}`;
-  jumpSelect.value = String(currentSlide);
+  if (jumpSelect) jumpSelect.value = String(currentSlide);
   setScormState();
 }}
 
@@ -984,10 +1143,10 @@ window.addEventListener("beforeunload", function() {{
 
 
 # ============================================================
-# ZIP build
+# Build ZIP
 # ============================================================
 
-def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str):
+def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str, show_nav: bool):
     prs = Presentation(io.BytesIO(pptx_bytes))
     course, media = extract_course(prs)
 
@@ -996,7 +1155,7 @@ def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str):
         for name, blob in media.items():
             zf.writestr(name, blob)
 
-        zf.writestr("index_lms.html", build_player_html(course_title, course))
+        zf.writestr("index_lms.html", build_player_html(course_title, course, show_nav=show_nav))
         zf.writestr("scormdriver.js", build_scorm_driver_js())
         zf.writestr(
             "imsmanifest.xml",
@@ -1028,25 +1187,22 @@ with st.expander("What this version supports"):
     st.markdown(
         """
 - Static slide image rendering in Python
+- Cropped normal images
+- Slide background images
+- Shape fill images where detectable
 - Text rendered into the slide image
 - Basic shapes: circles/ovals, rectangles, rounded rectangles, lines, simple arrows
 - Basic tables
-- Embedded images
 - External hyperlinks
 - Internal slide-jump hotspots
-- Shape-aware hotspots for circles/ovals
-- Rectangular fallback for unsupported shapes/polygons
-- Left slide menu and bottom centered navigation
-
-Still limited:
-- Not full PowerPoint fidelity
-- Unsupported complex shapes may render as simple fallbacks
-- Rotation and some advanced formatting are not fully handled
+- HTML hotspot overlays
+- Optional built-in navigation
         """
     )
 
 course_title = st.text_input("Course title", value="My SCORM Course")
 uploaded = st.file_uploader("Upload PPTX", type=["pptx"])
+show_nav = st.checkbox("Show built-in navigation", value=True)
 
 if st.button("Publish SCORM", type="primary", use_container_width=True):
     if not uploaded:
@@ -1057,6 +1213,7 @@ if st.button("Publish SCORM", type="primary", use_container_width=True):
                 uploaded.getvalue(),
                 uploaded.name,
                 course_title,
+                show_nav,
             )
             st.success("SCORM package created.")
             st.write(f"Slides detected: {summary['slides']}")
