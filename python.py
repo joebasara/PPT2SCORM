@@ -215,6 +215,14 @@ def get_crop_rect_from_shape(shape) -> Tuple[float, float, float, float]:
 
 def apply_crop_to_image(img: Image.Image, crop_rect: Tuple[float, float, float, float]) -> Image.Image:
     l, t, r, b = crop_rect
+
+    # Ignore obviously invalid crop values
+    if l < 0 or t < 0 or r < 0 or b < 0:
+        return img
+    if l >= 1 or t >= 1 or r >= 1 or b >= 1:
+        return img
+    if (l + r) >= 0.95 or (t + b) >= 0.95:
+        return img
     if max(l, t, r, b) <= 0:
         return img
 
@@ -228,6 +236,10 @@ def apply_crop_to_image(img: Image.Image, crop_rect: Tuple[float, float, float, 
     top = max(0, min(top, h - 1))
     right = max(left + 1, min(right, w))
     bottom = max(top + 1, min(bottom, h))
+
+    # Final sanity check
+    if right - left < 5 or bottom - top < 5:
+        return img
 
     return img.crop((left, top, right, bottom))
 
@@ -1103,4 +1115,5 @@ if st.button("Publish SCORM", type="primary", use_container_width=True):
 st.divider()
 st.subheader("requirements.txt")
 st.code("streamlit\npython-pptx\nlxml\nPillow\n")
+
 
