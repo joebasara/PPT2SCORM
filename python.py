@@ -123,22 +123,6 @@ def get_font(size_px: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-def normalize_url(url: Optional[str]) -> Optional[str]:
-    if not url:
-        return None
-    url = url.strip()
-    if not url:
-        return None
-
-    lowered = url.lower()
-    if lowered.startswith(("http://", "https://", "mailto:", "tel:")):
-        return url
-    if lowered.startswith("www."):
-        return "https://" + url
-
-    return None
-
-
 # ============================================================
 # XML / image helpers
 # ============================================================
@@ -216,7 +200,6 @@ def get_crop_rect_from_shape(shape) -> Tuple[float, float, float, float]:
 def apply_crop_to_image(img: Image.Image, crop_rect: Tuple[float, float, float, float]) -> Image.Image:
     l, t, r, b = crop_rect
 
-    # Ignore obviously invalid crop values
     if l < 0 or t < 0 or r < 0 or b < 0:
         return img
     if l >= 1 or t >= 1 or r >= 1 or b >= 1:
@@ -237,7 +220,6 @@ def apply_crop_to_image(img: Image.Image, crop_rect: Tuple[float, float, float, 
     right = max(left + 1, min(right, w))
     bottom = max(top + 1, min(bottom, h))
 
-    # Final sanity check
     if right - left < 5 or bottom - top < 5:
         return img
 
@@ -264,21 +246,8 @@ def get_slide_background_image_blob(slide) -> Optional[bytes]:
 
 
 # ============================================================
-# Hyperlinks / internal slide jumps
+# Internal links only
 # ============================================================
-
-def extract_shape_external_link(shape) -> Optional[str]:
-    try:
-        click_action = getattr(shape, "click_action", None)
-        if click_action is not None:
-            hyperlink = getattr(click_action, "hyperlink", None)
-            if hyperlink is not None:
-                address = getattr(hyperlink, "address", None)
-                return normalize_url(address)
-    except Exception:
-        pass
-    return None
-
 
 def detect_internal_link_target(slides, slide_idx_zero: int, shape) -> Optional[int]:
     try:
@@ -503,11 +472,9 @@ def paste_picture(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y
 
         original = Image.open(io.BytesIO(blob)).convert("RGBA")
 
-        # Try cropped version first
         try:
             cropped = apply_crop_to_image(original.copy(), get_crop_rect_from_shape(shape))
             cw, ch = cropped.size
-            # If crop produced something implausibly tiny, fall back
             if cw < 10 or ch < 10:
                 cropped = original
         except Exception:
@@ -543,10 +510,17 @@ def render_shape_recursive(canvas: Image.Image, draw: ImageDraw.ImageDraw, shape
             pass
         return
 
-    paste_picture(canvas, shape, scale, offset_x, offset_y)
+    is_picture = False
+    try:
+        if get_picture_blob_from_shape(shape):
+            pasted = paste_picture(canvas, shape, scale, offset_x, offset_y)
+            is_picture = bool(pasted)
+    except Exception:
+        is_picture = False
 
     try:
-        draw_shape_object(draw, shape, scale, offset_x, offset_y)
+        if not is_picture:
+            draw_shape_object(draw, shape, scale, offset_x, offset_y)
     except Exception:
         pass
 
@@ -594,14 +568,9 @@ def collect_hotspots_recursive(shape, prs, slide_idx_zero: int, hotspots: List[D
 
     try:
         internal = detect_internal_link_target(prs.slides, slide_idx_zero, shape)
-        external = None if internal is not None else extract_shape_external_link(shape)
-
-        if internal is not None or external:
+        if internal is not None:
             geom = hotspot_geometry_for_shape(shape, offset_x, offset_y)
-            if internal is not None:
-                geom = {**geom, "kind": "internal", "target_slide": internal}
-            else:
-                geom = {**geom, "kind": "external", "url": external}
+            geom = {**geom, "kind": "internal", "target_slide": internal}
             hotspots.append(geom)
     except Exception:
         pass
@@ -875,7 +844,7 @@ body {{
       <button onclick="nextSlide()">Next</button>
     </div>
 
-    <div class="footer">Static slide image with HTML hotspot overlays.</div>
+    <div class="footer">Static slide image with internal-link hotspots.</div>
   </div>
 </div>
 
@@ -942,14 +911,8 @@ function createHotspot(link) {{
   el.addEventListener("click", function(e) {{
     e.preventDefault();
     e.stopPropagation();
-
-    if (link.kind === "internal" && link.target_slide) {{
+    if (link.target_slide) {{
       goToSlide(Number(link.target_slide));
-      return;
-    }}
-
-    if (link.kind === "external" && link.url) {{
-      window.open(link.url, "_blank", "noopener,noreferrer");
     }}
   }});
 
@@ -1067,17 +1030,17 @@ def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str, show_n
 
 st.set_page_config(page_title=APP_TITLE, layout="centered")
 st.title(APP_TITLE)
-st.caption("Pure-Python MVP: PPTX → static slide images + hotspots → SCORM 1.2 ZIP")
+st.caption("Pure-Python MVP: PPTX → static slide images + internal-link hotspots → SCORM 1.2 ZIP")
 
 with st.expander("What this version supports"):
     st.markdown(
         """
 - Static slide image rendering in Python
-- Cropped normal images
+- Normal inserted pictures
+- Cropped pictures
 - Slide background images
 - Text rendered into the slide image
 - Basic shapes: circles/ovals, rectangles, rounded rectangles, lines, simple arrows
-- External hyperlinks
 - Internal slide-jump hotspots
 - HTML hotspot overlays
 - Optional built-in navigation
@@ -1115,5 +1078,3 @@ if st.button("Publish SCORM", type="primary", use_container_width=True):
 st.divider()
 st.subheader("requirements.txt")
 st.code("streamlit\npython-pptx\nlxml\nPillow\n")
-
-
