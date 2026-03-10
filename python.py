@@ -489,9 +489,19 @@ def paste_picture(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y
         w = max(1, emu_to_px(w_emu, scale))
         h = max(1, emu_to_px(h_emu, scale))
 
-        img = Image.open(io.BytesIO(blob)).convert("RGBA")
-        img = apply_crop_to_image(img, get_crop_rect_from_shape(shape))
-        paste_image_into_box(canvas, img, x, y, w, h)
+        original = Image.open(io.BytesIO(blob)).convert("RGBA")
+
+        # Try cropped version first
+        try:
+            cropped = apply_crop_to_image(original.copy(), get_crop_rect_from_shape(shape))
+            cw, ch = cropped.size
+            # If crop produced something implausibly tiny, fall back
+            if cw < 10 or ch < 10:
+                cropped = original
+        except Exception:
+            cropped = original
+
+        paste_image_into_box(canvas, cropped, x, y, w, h)
         return True
     except Exception:
         return False
@@ -1093,3 +1103,4 @@ if st.button("Publish SCORM", type="primary", use_container_width=True):
 st.divider()
 st.subheader("requirements.txt")
 st.code("streamlit\npython-pptx\nlxml\nPillow\n")
+
