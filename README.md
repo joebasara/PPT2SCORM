@@ -1,8 +1,6 @@
 # PPTX to SCORM Converter
 
-This Streamlit app converts PowerPoint (.pptx) files into SCORM 1.2 packages.
-
-It is designed for testing SCORM uploads in LMS platforms such as Blackboard.
+This Streamlit app converts PowerPoint (.pptx) files into SCORM 1.2 packages to upload in LMS platforms such as Blackboard.
 
 ## Features
 
@@ -35,4 +33,5 @@ This MVP does not fully reproduce PowerPoint rendering. The following are not su
 - animations
 - transitions
 - SmartArt
+
 - advanced triggers
