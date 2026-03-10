@@ -1,7 +1,6 @@
 import html
 import io
 import json
-import math
 import re
 import uuid
 import zipfile
@@ -92,7 +91,7 @@ def emu_to_px(value: float, scale: float) -> int:
     return int(round(value * scale))
 
 
-def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
     words = text.split()
     if not words:
         return []
@@ -124,6 +123,22 @@ def get_font(size_px: int, bold: bool = False):
     return ImageFont.load_default()
 
 
+def normalize_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    url = url.strip()
+    if not url:
+        return None
+
+    lowered = url.lower()
+    if lowered.startswith(("http://", "https://", "mailto:", "tel:")):
+        return url
+    if lowered.startswith("www."):
+        return "https://" + url
+
+    return None
+
+
 # ============================================================
 # XML / image helpers
 # ============================================================
@@ -139,18 +154,51 @@ def find_descendant_by_localname(el, name: str):
     return None
 
 
-def find_descendants_by_localname(el, name: str):
-    out = []
-    for node in el.iter():
-        if local_name(node.tag) == name:
-            out.append(node)
-    return out
+def get_image_blob_from_rid(part, rid: str) -> Optional[bytes]:
+    try:
+        rel = part.related_part(rid)
+        blob = getattr(rel, "blob", None)
+        if blob:
+            return blob
+    except Exception:
+        pass
+    return None
+
+
+def get_blip_rid_from_element(el) -> Optional[str]:
+    try:
+        blip = find_descendant_by_localname(el, "blip")
+        if blip is None:
+            return None
+        for k, v in blip.attrib.items():
+            if k.endswith("embed"):
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def get_picture_blob_from_shape(shape) -> Optional[bytes]:
+    try:
+        image = getattr(shape, "image", None)
+        if image is not None:
+            blob = getattr(image, "blob", None)
+            if blob:
+                return blob
+    except Exception:
+        pass
+
+    try:
+        rid = get_blip_rid_from_element(shape.element)
+        if rid:
+            return get_image_blob_from_rid(shape.part, rid)
+    except Exception:
+        pass
+
+    return None
 
 
 def get_crop_rect_from_shape(shape) -> Tuple[float, float, float, float]:
-    """
-    Returns crop fractions (left, top, right, bottom) in range 0..1
-    """
     try:
         src_rect = find_descendant_by_localname(shape.element, "srcRect")
         if src_rect is None:
@@ -184,54 +232,17 @@ def apply_crop_to_image(img: Image.Image, crop_rect: Tuple[float, float, float, 
     return img.crop((left, top, right, bottom))
 
 
-def get_image_blob_from_rid(shape_part, rid: str) -> Optional[bytes]:
-    try:
-        rel = shape_part.related_part(rid)
-        blob = getattr(rel, "blob", None)
-        if blob:
-            return blob
-    except Exception:
-        pass
-    return None
-
-
-def get_shape_fill_image_blob(shape) -> Optional[bytes]:
-    try:
-        blip = find_descendant_by_localname(shape.element, "blip")
-        if blip is None:
-            return None
-
-        rid = None
-        for k, v in blip.attrib.items():
-            if k.endswith("embed"):
-                rid = v
-                break
-        if not rid:
-            return None
-
-        return get_image_blob_from_rid(shape.part, rid)
-    except Exception:
-        return None
-
-
 def get_slide_background_image_blob(slide) -> Optional[bytes]:
     try:
-        bg = slide.background
-        fill = getattr(bg, "fill", None)
-        _ = fill  # keep for sanity, not strictly needed
-    except Exception:
-        pass
-
-    try:
-        blip = find_descendant_by_localname(slide._element, "blip")
-        if blip is None:
+        bg = find_descendant_by_localname(slide._element, "bg")
+        if bg is None:
             return None
 
-        rid = None
-        for k, v in blip.attrib.items():
-            if k.endswith("embed"):
-                rid = v
-                break
+        blip_fill = find_descendant_by_localname(bg, "blipFill")
+        if blip_fill is None:
+            return None
+
+        rid = get_blip_rid_from_element(blip_fill)
         if not rid:
             return None
 
@@ -241,7 +252,7 @@ def get_slide_background_image_blob(slide) -> Optional[bytes]:
 
 
 # ============================================================
-# Hyperlinks / hotspots
+# Hyperlinks / internal slide jumps
 # ============================================================
 
 def extract_shape_external_link(shape) -> Optional[str]:
@@ -251,8 +262,7 @@ def extract_shape_external_link(shape) -> Optional[str]:
             hyperlink = getattr(click_action, "hyperlink", None)
             if hyperlink is not None:
                 address = getattr(hyperlink, "address", None)
-                if address:
-                    return address
+                return normalize_url(address)
     except Exception:
         pass
     return None
@@ -394,147 +404,30 @@ def draw_text_box(draw, shape, scale: float, offset_x=0, offset_y=0):
     for para in text_frame.paragraphs:
         txt = "".join(run.text or "" for run in para.runs).strip()
         if txt:
-            paragraphs.append((para, txt))
+            paragraphs.append(txt)
 
     if not paragraphs:
         return
 
-    first_run = None
-    for para, _ in paragraphs:
-        if para.runs:
-            first_run = para.runs[0]
-            break
+    font_size = max(10, int(18 * scale))
+    font = get_font(font_size, bold=False)
+    line_gap = max(2, int(font_size * 0.2))
 
-    font_size = 22
-    font_bold = False
-    font_fill = (0, 0, 0, 255)
-
-    if first_run:
-        try:
-            fs = getattr(first_run.font, "size", None)
-            if fs is not None:
-                font_size = max(10, int(fs.pt * scale))
-        except Exception:
-            pass
-        try:
-            font_bold = bool(getattr(first_run.font, "bold", False))
-        except Exception:
-            pass
-        try:
-            font_fill = color_to_rgb(first_run.font.color, default=(0, 0, 0)) + (255,)
-        except Exception:
-            pass
-
-    font = get_font(font_size, bold=font_bold)
-    line_gap = max(2, int(font_size * 0.25))
-    all_lines = []
-    line_aligns = []
-
-    for para, txt in paragraphs:
-        max_width = max(10, w - 8)
-        lines = fit_text_lines(draw, txt, font, max_width)
-        if not lines:
-            lines = [txt]
-        align = "left"
-        try:
-            if para.alignment is not None:
-                name = str(para.alignment).lower()
-                if "center" in name:
-                    align = "center"
-                elif "right" in name:
-                    align = "right"
-        except Exception:
-            pass
-        for line in lines:
-            all_lines.append(line)
-            line_aligns.append(align)
+    lines = []
+    for txt in paragraphs:
+        wrapped = fit_text_lines(draw, txt, font, max(10, w - 8))
+        lines.extend(wrapped if wrapped else [txt])
 
     bbox = draw.textbbox((0, 0), "Ag", font=font)
     line_h = max(1, bbox[3] - bbox[1])
-    total_h = len(all_lines) * line_h + max(0, len(all_lines) - 1) * line_gap
+    total_h = len(lines) * line_h + max(0, len(lines) - 1) * line_gap
+    cy = y + max(4, (h - total_h) // 2)
 
-    v_align = "top"
-    try:
-        name = str(text_frame.vertical_anchor).lower()
-        if "middle" in name:
-            v_align = "middle"
-        elif "bottom" in name:
-            v_align = "bottom"
-    except Exception:
-        pass
-
-    if v_align == "middle":
-        cy = y + (h - total_h) // 2
-    elif v_align == "bottom":
-        cy = y + h - total_h - 4
-    else:
-        cy = y + 4
-
-    for line, align in zip(all_lines, line_aligns):
+    for line in lines:
         tw = draw.textlength(line, font=font)
-        if align == "center":
-            tx = x + (w - tw) / 2
-        elif align == "right":
-            tx = x + w - tw - 4
-        else:
-            tx = x + 4
-        draw.text((tx, cy), line, font=font, fill=font_fill)
+        tx = x + max(4, (w - tw) / 2)
+        draw.text((tx, cy), line, font=font, fill=(0, 0, 0, 255))
         cy += line_h + line_gap
-
-
-def draw_table(draw, shape, scale: float, offset_x=0, offset_y=0):
-    try:
-        table = shape.table
-    except Exception:
-        return
-
-    x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
-    x = emu_to_px(x_emu, scale)
-    y = emu_to_px(y_emu, scale)
-    w = max(4, emu_to_px(w_emu, scale))
-    h = max(4, emu_to_px(h_emu, scale))
-
-    try:
-        col_widths = [emu_to_px(col.width, scale) for col in table.columns]
-    except Exception:
-        col_count = len(table.columns)
-        col_widths = [w // max(1, col_count)] * max(1, col_count)
-
-    try:
-        row_heights = [emu_to_px(row.height, scale) for row in table.rows]
-    except Exception:
-        row_count = len(table.rows)
-        row_heights = [h // max(1, row_count)] * max(1, row_count)
-
-    cy = y
-    for r_idx, row in enumerate(table.rows):
-        rh = row_heights[r_idx] if r_idx < len(row_heights) else max(20, h // max(1, len(table.rows)))
-        cx = x
-        for c_idx, cell in enumerate(row.cells):
-            cw = col_widths[c_idx] if c_idx < len(col_widths) else max(30, w // max(1, len(table.columns)))
-            fill = (255, 255, 255, 0)
-            try:
-                fill = color_to_rgb(cell.fill.fore_color, default=(255, 255, 255)) + (255,)
-            except Exception:
-                pass
-
-            draw.rectangle((cx, cy, cx + cw, cy + rh), fill=fill, outline=(85, 85, 85, 255), width=1)
-
-            text = cell.text.strip()
-            if text:
-                font = get_font(max(11, int(16 * scale)))
-                lines = fit_text_lines(draw, text, font, max(10, cw - 8))
-                bbox = draw.textbbox((0, 0), "Ag", font=font)
-                lh = max(1, bbox[3] - bbox[1])
-                total_h = len(lines) * lh
-                ty = cy + max(2, (rh - total_h) // 2)
-                for line in lines:
-                    tw = draw.textlength(line, font=font)
-                    tx = cx + max(4, (cw - tw) / 2)
-                    draw.text((tx, ty), line, font=font, fill=(0, 0, 0, 255))
-                    ty += lh
-            cx += cw
-        cy += rh
 
 
 def draw_shape_object(draw, shape, scale: float, offset_x=0, offset_y=0):
@@ -586,27 +479,10 @@ def paste_image_into_box(canvas: Image.Image, img: Image.Image, x: int, y: int, 
 
 def paste_picture(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y=0):
     try:
-        image = shape.image
-        if image is None:
-            return
-        x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
-        x = emu_to_px(x_emu, scale)
-        y = emu_to_px(y_emu, scale)
-        w = max(1, emu_to_px(w_emu, scale))
-        h = max(1, emu_to_px(h_emu, scale))
-
-        img = Image.open(io.BytesIO(image.blob)).convert("RGBA")
-        img = apply_crop_to_image(img, get_crop_rect_from_shape(shape))
-        paste_image_into_box(canvas, img, x, y, w, h)
-    except Exception:
-        pass
-
-
-def paste_shape_fill_image(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y=0):
-    try:
-        blob = get_shape_fill_image_blob(shape)
+        blob = get_picture_blob_from_shape(shape)
         if not blob:
             return False
+
         x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
         x = emu_to_px(x_emu, scale)
         y = emu_to_px(y_emu, scale)
@@ -614,13 +490,14 @@ def paste_shape_fill_image(canvas: Image.Image, shape, scale: float, offset_x=0,
         h = max(1, emu_to_px(h_emu, scale))
 
         img = Image.open(io.BytesIO(blob)).convert("RGBA")
+        img = apply_crop_to_image(img, get_crop_rect_from_shape(shape))
         paste_image_into_box(canvas, img, x, y, w, h)
         return True
     except Exception:
         return False
 
 
-def paste_slide_background(canvas: Image.Image, slide, prs: Presentation):
+def paste_slide_background(canvas: Image.Image, slide):
     try:
         blob = get_slide_background_image_blob(slide)
         if not blob:
@@ -644,22 +521,7 @@ def render_shape_recursive(canvas: Image.Image, draw: ImageDraw.ImageDraw, shape
             pass
         return
 
-    used_fill_img = False
-    try:
-        used_fill_img = paste_shape_fill_image(canvas, shape, scale, offset_x, offset_y)
-    except Exception:
-        used_fill_img = False
-
-    try:
-        if getattr(shape, "image", None) is not None:
-            paste_picture(canvas, shape, scale, offset_x, offset_y)
-    except Exception:
-        pass
-
-    try:
-        draw_table(draw, shape, scale, offset_x, offset_y)
-    except Exception:
-        pass
+    paste_picture(canvas, shape, scale, offset_x, offset_y)
 
     try:
         draw_shape_object(draw, shape, scale, offset_x, offset_y)
@@ -682,7 +544,7 @@ def render_slide_to_png(slide, prs: Presentation) -> bytes:
     canvas = Image.new("RGBA", (CANVAS_W, canvas_h), (255, 255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    paste_slide_background(canvas, slide, prs)
+    paste_slide_background(canvas, slide)
 
     for shape in slide.shapes:
         render_shape_recursive(canvas, draw, shape, scale)
@@ -693,7 +555,7 @@ def render_slide_to_png(slide, prs: Presentation) -> bytes:
 
 
 # ============================================================
-# Extract course package data
+# Collect hotspots / course data
 # ============================================================
 
 def collect_hotspots_recursive(shape, prs, slide_idx_zero: int, hotspots: List[Dict[str, Any]], offset_x=0, offset_y=0):
@@ -709,14 +571,15 @@ def collect_hotspots_recursive(shape, prs, slide_idx_zero: int, hotspots: List[D
         return
 
     try:
-        external = extract_shape_external_link(shape)
         internal = detect_internal_link_target(prs.slides, slide_idx_zero, shape)
-        if external or internal:
+        external = None if internal is not None else extract_shape_external_link(shape)
+
+        if internal is not None or external:
             geom = hotspot_geometry_for_shape(shape, offset_x, offset_y)
-            if external:
-                geom = {**geom, "kind": "external", "url": external}
-            else:
+            if internal is not None:
                 geom = {**geom, "kind": "internal", "target_slide": internal}
+            else:
+                geom = {**geom, "kind": "external", "url": external}
             hotspots.append(geom)
     except Exception:
         pass
@@ -840,7 +703,6 @@ def build_player_html(title: str, course: Dict[str, Any], show_nav: bool) -> str
     data = json.dumps(course, ensure_ascii=False)
     sidebar_style = "" if show_nav else "display:none;"
     bottombar_style = "display:flex;" if show_nav else "display:none;"
-    app_padding_left = "130px" if show_nav else "0"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -929,6 +791,7 @@ body {{
 .hotspot-layer {{
   position: absolute;
   inset: 0;
+  pointer-events: none;
 }}
 .hotspot {{
   position: absolute;
@@ -1020,29 +883,16 @@ function populateJumpMenu() {{
 }}
 
 function createHotspot(link) {{
-  const a = document.createElement("a");
-  a.className = "hotspot";
-  a.href = "#";
-
-  if (link.kind === "external" && link.url) {{
-    a.href = link.url;
-    a.target = "_blank";
-    a.rel = "noopener noreferrer";
-  }} else if (link.kind === "internal" && link.target_slide) {{
-    a.addEventListener("click", function(e) {{
-      e.preventDefault();
-      goToSlide(Number(link.target_slide));
-    }});
-  }} else {{
-    return null;
-  }}
+  const el = document.createElement("div");
+  el.className = "hotspot";
+  el.style.cursor = "pointer";
 
   if (link.geom === "ellipse") {{
-    a.classList.add("ellipse");
-    a.style.left = pct(link.x, course.slideWidthEmu) + "%";
-    a.style.top = pct(link.y, course.slideHeightEmu) + "%";
-    a.style.width = pct(link.w, course.slideWidthEmu) + "%";
-    a.style.height = pct(link.h, course.slideHeightEmu) + "%";
+    el.classList.add("ellipse");
+    el.style.left = pct(link.x, course.slideWidthEmu) + "%";
+    el.style.top = pct(link.y, course.slideHeightEmu) + "%";
+    el.style.width = pct(link.w, course.slideWidthEmu) + "%";
+    el.style.height = pct(link.h, course.slideHeightEmu) + "%";
   }} else if (link.geom === "line") {{
     const x1p = pct(link.x1, course.slideWidthEmu);
     const y1p = pct(link.y1, course.slideHeightEmu);
@@ -1051,23 +901,37 @@ function createHotspot(link) {{
 
     const dx = x2p - x1p;
     const dy = y2p - y1p;
-    const len = Math.sqrt(dx*dx + dy*dy);
+    const len = Math.sqrt(dx * dx + dy * dy);
     const angle = Math.atan2(dy, dx) * 180 / Math.PI;
 
-    a.style.left = x1p + "%";
-    a.style.top = y1p + "%";
-    a.style.width = len + "%";
-    a.style.height = "2%";
-    a.style.transformOrigin = "0 50%";
-    a.style.transform = `translateY(-50%) rotate(${{angle}}deg)`;
+    el.style.left = x1p + "%";
+    el.style.top = y1p + "%";
+    el.style.width = len + "%";
+    el.style.height = "2%";
+    el.style.transformOrigin = "0 50%";
+    el.style.transform = `translateY(-50%) rotate(${{angle}}deg)`;
   }} else {{
-    a.style.left = pct(link.x, course.slideWidthEmu) + "%";
-    a.style.top = pct(link.y, course.slideHeightEmu) + "%";
-    a.style.width = pct(link.w, course.slideWidthEmu) + "%";
-    a.style.height = pct(link.h, course.slideHeightEmu) + "%";
+    el.style.left = pct(link.x, course.slideWidthEmu) + "%";
+    el.style.top = pct(link.y, course.slideHeightEmu) + "%";
+    el.style.width = pct(link.w, course.slideWidthEmu) + "%";
+    el.style.height = pct(link.h, course.slideHeightEmu) + "%";
   }}
 
-  return a;
+  el.addEventListener("click", function(e) {{
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (link.kind === "internal" && link.target_slide) {{
+      goToSlide(Number(link.target_slide));
+      return;
+    }}
+
+    if (link.kind === "external" && link.url) {{
+      window.open(link.url, "_blank", "noopener,noreferrer");
+    }}
+  }});
+
+  return el;
 }}
 
 function renderHotspots(slide) {{
@@ -1189,10 +1053,8 @@ with st.expander("What this version supports"):
 - Static slide image rendering in Python
 - Cropped normal images
 - Slide background images
-- Shape fill images where detectable
 - Text rendered into the slide image
 - Basic shapes: circles/ovals, rectangles, rounded rectangles, lines, simple arrows
-- Basic tables
 - External hyperlinks
 - Internal slide-jump hotspots
 - HTML hotspot overlays
