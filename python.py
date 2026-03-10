@@ -49,6 +49,13 @@ def color_to_hex(color_obj) -> Optional[str]:
     return None
 
 
+def get_auto_shape_type(shape):
+    try:
+        return shape.auto_shape_type
+    except Exception:
+        return None
+
+
 def shape_fill_color(shape) -> str:
     try:
         fill = shape.fill
@@ -75,7 +82,6 @@ def shape_line_color(shape) -> str:
 def shape_line_width_px(shape) -> float:
     try:
         width_emu = float(shape.line.width)
-        # Rough screen-friendly conversion
         px = width_emu / 12700.0
         return max(px, 1.0)
     except Exception:
@@ -276,7 +282,7 @@ def custom_polygon_points(auto, x, y, w, h) -> Optional[List[Tuple[float, float]
 
 def hotspot_geometry_for_shape(shape, offset_x=0, offset_y=0) -> Dict[str, Any]:
     x, y, w, h = shape_bounds(shape, offset_x, offset_y)
-    auto = getattr(shape, "auto_shape_type", None)
+    auto = get_auto_shape_type(shape)
     shape_type = getattr(shape, "shape_type", None)
 
     if shape_type == MSO_SHAPE_TYPE.LINE:
@@ -329,7 +335,7 @@ def svg_shape_spec(shape, slide_w, slide_h, offset_x=0, offset_y=0) -> Optional[
     fill = shape_fill_color(shape)
     stroke = shape_line_color(shape)
     stroke_width = shape_line_width_px(shape)
-    auto = getattr(shape, "auto_shape_type", None)
+    auto = get_auto_shape_type(shape)
     shape_type = getattr(shape, "shape_type", None)
 
     if shape_type == MSO_SHAPE_TYPE.LINE:
@@ -498,11 +504,6 @@ def extract_table_element(shape, offset_x=0, offset_y=0) -> Optional[Dict[str, A
     except Exception:
         col_widths = []
 
-    try:
-        row_heights = [int(row.height) for row in table.rows]
-    except Exception:
-        row_heights = []
-
     rows = []
     for row in table.rows:
         cells = []
@@ -540,7 +541,6 @@ def extract_table_element(shape, offset_x=0, offset_y=0) -> Optional[Dict[str, A
         "w": w,
         "h": h,
         "col_widths": col_widths,
-        "row_heights": row_heights,
         "rows": rows,
     }
 
@@ -587,7 +587,6 @@ def process_shape(
 ):
     shape_type = getattr(shape, "shape_type", None)
 
-    # Group shapes: recurse
     if shape_type == MSO_SHAPE_TYPE.GROUP:
         gx, gy, _, _ = shape_bounds(shape, offset_x, offset_y)
         try:
@@ -607,29 +606,24 @@ def process_shape(
             pass
         return
 
-    # Images
     img_el = extract_image_element(shape, media, slide_index_one, counters["images"] + 1, offset_x, offset_y)
     if img_el is not None:
         counters["images"] += 1
         slide_out["images"].append(img_el)
 
-    # Tables
     table_el = extract_table_element(shape, offset_x, offset_y)
     if table_el is not None:
         slide_out["tables"].append(table_el)
 
-    # SVG shapes
     svg = svg_shape_spec(shape, int(prs.slide_width), int(prs.slide_height), offset_x, offset_y)
     if svg is not None:
         slide_out["svg_shapes"].append(svg)
 
-    # Text
-    default_center = getattr(shape, "auto_shape_type", None) is not None
+    default_center = get_auto_shape_type(shape) is not None
     text_el = extract_text_element(shape, offset_x, offset_y, default_center=default_center)
     if text_el is not None:
         slide_out["text_elements"].append(text_el)
 
-    # Hotspots from shape click actions
     try:
         external = extract_shape_external_link(shape)
         internal = detect_internal_link_target(prs.slides, slide_idx_zero, shape)
@@ -1066,9 +1060,10 @@ function renderTables(slide) {{
 
     if (t.col_widths && t.col_widths.length) {{
       const cg = document.createElement("colgroup");
+      const total = t.col_widths.reduce((a,b)=>a+b,0);
       for (const cw of t.col_widths) {{
         const col = document.createElement("col");
-        col.style.width = pct(cw, t.col_widths.reduce((a,b)=>a+b,0)) + "%";
+        col.style.width = pct(cw, total) + "%";
         cg.appendChild(col);
       }}
       table.appendChild(cg);
@@ -1108,11 +1103,6 @@ function renderText(slide) {{
     div.innerHTML = inner;
     textLayer.appendChild(div);
   }}
-}}
-
-function makeHref(link) {{
-  if (link.kind === "external" && link.url) return link.url;
-  return "#";
 }}
 
 function addHotspotAnchor(el, link) {{
