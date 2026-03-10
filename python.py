@@ -1,1119 +1,708 @@
+import base64
+import html
 import io
 import json
+import math
+import os
 import re
-import uuid
+import shutil
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from pptx import Presentation
-from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_SHAPE_TYPE
-
-APP_TITLE = "PPTX to SCORM Publisher"
-CANVAS_W = 1600
+from pptx.enum.action import PP_ACTION
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 
-# ============================================================
+# =========================
+# App config
+# =========================
+st.set_page_config(page_title="PPT to SCORM", layout="wide")
+st.title("PPT to SCORM Package Generator")
+
+
+# =========================
 # Helpers
-# ============================================================
+# =========================
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r"[^\w\-. ]+", "_", name).strip()
+    return name or "package"
 
-def safe_name(value: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    return value.strip("._-") or "course"
+
+def px_from_emu(emu: int) -> float:
+    # 1 inch = 914400 EMU, 96 px = 1 inch
+    return emu * 96.0 / 914400.0
 
 
-def get_auto_shape_type(shape):
+def shape_has_internal_jump(shape) -> tuple[bool, int | None]:
+    """
+    Returns (True, target_slide_index_1_based) if shape has an internal jump action.
+    Otherwise returns (False, None).
+    """
     try:
-        return shape.auto_shape_type
-    except Exception:
-        return None
+        click_action = shape.click_action
+        action = click_action.action
 
+        # Common internal jump types
+        if action == PP_ACTION.NAMED_SLIDE:
+            target = click_action.target_slide
+            if target is not None:
+                return True, target.slide_id
 
-def shape_bounds(shape, offset_x: int = 0, offset_y: int = 0) -> Tuple[int, int, int, int]:
-    return (
-        int(getattr(shape, "left", 0)) + offset_x,
-        int(getattr(shape, "top", 0)) + offset_y,
-        int(getattr(shape, "width", 0)),
-        int(getattr(shape, "height", 0)),
-    )
+        if action == PP_ACTION.FIRST_SLIDE:
+            return True, -1
 
+        if action == PP_ACTION.LAST_SLIDE:
+            return True, -2
 
-def color_to_rgb(color_obj, default=(0, 0, 0)):
-    try:
-        rgb = getattr(color_obj, "rgb", None)
-        if rgb:
-            s = str(rgb)
-            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
-    except Exception:
-        pass
-    return default
+        if action == PP_ACTION.NEXT_SLIDE:
+            return True, -3
 
+        if action == PP_ACTION.PREVIOUS_SLIDE:
+            return True, -4
 
-def shape_fill_rgba(shape, default=(255, 255, 255, 0)):
-    try:
-        fill = shape.fill
-        fc = fill.fore_color
-        rgb = getattr(fc, "rgb", None)
-        if rgb:
-            s = str(rgb)
-            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
     except Exception:
         pass
-    return default
+
+    return False, None
 
 
-def shape_has_visible_outline(shape) -> bool:
+def build_slide_id_to_index(prs: Presentation) -> dict[int, int]:
+    mapping = {}
+    for idx, slide in enumerate(prs.slides, start=1):
+        mapping[slide.slide_id] = idx
+    return mapping
+
+
+def resolve_relative_target(current_idx: int, target_marker: int, total_slides: int) -> int | None:
+    if target_marker == -1:
+        return 1
+    if target_marker == -2:
+        return total_slides
+    if target_marker == -3:
+        return min(total_slides, current_idx + 1)
+    if target_marker == -4:
+        return max(1, current_idx - 1)
+    return None
+
+
+def extract_internal_hotspots(prs: Presentation) -> list[dict]:
+    slide_id_to_index = build_slide_id_to_index(prs)
+    total_slides = len(prs.slides)
+    slides_data = []
+
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        hotspots = []
+
+        for shape in slide.shapes:
+            try:
+                has_jump, target = shape_has_internal_jump(shape)
+                if not has_jump:
+                    continue
+
+                target_index = None
+                if target in slide_id_to_index:
+                    target_index = slide_id_to_index[target]
+                else:
+                    target_index = resolve_relative_target(slide_idx, target, total_slides)
+
+                if not target_index:
+                    continue
+
+                x = px_from_emu(shape.left)
+                y = px_from_emu(shape.top)
+                w = px_from_emu(shape.width)
+                h = px_from_emu(shape.height)
+
+                if w <= 1 or h <= 1:
+                    continue
+
+                hotspots.append(
+                    {
+                        "x": round(x, 2),
+                        "y": round(y, 2),
+                        "w": round(w, 2),
+                        "h": round(h, 2),
+                        "target": target_index,
+                    }
+                )
+
+            except Exception:
+                continue
+
+        slides_data.append({"slide": slide_idx, "hotspots": hotspots})
+
+    return slides_data
+
+
+def find_libreoffice() -> str | None:
+    candidates = [
+        shutil.which("soffice"),
+        shutil.which("libreoffice"),
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def export_slides_with_powerpoint_windows(pptx_path: str, out_dir: str) -> bool:
+    """
+    Best rendering on Windows if PowerPoint is installed.
+    Exports each slide as PNG.
+    """
     try:
-        line = shape.line
-        color = getattr(line.color, "rgb", None)
-        width = getattr(line, "width", None)
-        if color is None:
-            return False
-        if width is None:
-            return False
-        return float(width) > 0
+        import win32com.client  # type: ignore
     except Exception:
         return False
 
+    powerpoint = None
+    presentation = None
+    try:
+        powerpoint = win32com.client.Dispatch("PowerPoint.Application")
+        powerpoint.Visible = 1
+        presentation = powerpoint.Presentations.Open(os.path.abspath(pptx_path), WithWindow=False)
+        presentation.Export(os.path.abspath(out_dir), "PNG")
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if presentation is not None:
+                presentation.Close()
+        except Exception:
+            pass
+        try:
+            if powerpoint is not None:
+                powerpoint.Quit()
+        except Exception:
+            pass
 
-def shape_line_rgba(shape, default=(0, 0, 0, 0)):
-    if not shape_has_visible_outline(shape):
-        return (0, 0, 0, 0)
+
+def export_slides_with_libreoffice(pptx_path: str, out_dir: str) -> bool:
+    soffice = find_libreoffice()
+    if not soffice:
+        return False
 
     try:
-        line = shape.line
-        c = line.color
-        rgb = getattr(c, "rgb", None)
-        if rgb:
-            s = str(rgb)
-            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4)) + (255,)
+        subprocess.run(
+            [
+                soffice,
+                "--headless",
+                "--convert-to",
+                "png",
+                "--outdir",
+                out_dir,
+                pptx_path,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
     except Exception:
-        pass
-    return default
+        return False
+
+    # LibreOffice often exports the whole deck as multiple slide PNGs into the folder.
+    # Some systems may instead create a single file or use naming patterns.
+    pngs = list(Path(out_dir).glob("*.png"))
+    return len(pngs) > 0
 
 
-def shape_line_width_px(shape, scale: float) -> int:
-    if not shape_has_visible_outline(shape):
-        return 0
-    try:
-        width_emu = float(shape.line.width)
-        px = int(max(1, round((width_emu / 12700.0) * scale)))
-        return px
-    except Exception:
-        return max(1, int(round(2 * scale)))
-
-
-def emu_to_px(value: float, scale: float) -> int:
-    return int(round(value * scale))
-
-
-def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
-    words = text.split()
-    if not words:
+def collect_exported_slide_images(export_dir: str, expected_count: int) -> list[Path]:
+    """
+    Tries to sort exported PNGs into slide order.
+    """
+    pngs = list(Path(export_dir).glob("*.png"))
+    if not pngs:
         return []
 
-    lines = []
-    current = words[0]
-    for w in words[1:]:
-        trial = current + " " + w
-        if draw.textlength(trial, font=font) <= max_width:
-            current = trial
-        else:
-            lines.append(current)
-            current = w
-    lines.append(current)
-    return lines
-
-
-def get_font(size_px: int, bold: bool = False):
-    candidates = (
-        ["arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"]
-        if bold
-        else ["arial.ttf", "Arial.ttf", "DejaVuSans.ttf"]
-    )
-    for name in candidates:
-        try:
-            return ImageFont.truetype(name, size_px)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-# ============================================================
-# XML / image helpers
-# ============================================================
-
-def local_name(tag: str) -> str:
-    return tag.split("}")[-1] if "}" in tag else tag
-
-
-def find_descendant_by_localname(el, name: str):
-    for node in el.iter():
-        if local_name(node.tag) == name:
-            return node
-    return None
-
-
-def get_image_blob_from_rid(part, rid: str) -> Optional[bytes]:
-    try:
-        rel = part.related_part(rid)
-        blob = getattr(rel, "blob", None)
-        if blob:
-            return blob
-    except Exception:
-        pass
-    return None
-
-
-def get_blip_rid_from_element(el) -> Optional[str]:
-    try:
-        blip = find_descendant_by_localname(el, "blip")
-        if blip is None:
-            return None
-        for k, v in blip.attrib.items():
-            if k.endswith("embed"):
-                return v
-    except Exception:
-        pass
-    return None
-
-
-def get_picture_blob_from_shape(shape) -> Optional[bytes]:
-    try:
-        image = getattr(shape, "image", None)
-        if image is not None:
-            blob = getattr(image, "blob", None)
-            if blob:
-                return blob
-    except Exception:
-        pass
-
-    try:
-        rid = get_blip_rid_from_element(shape.element)
-        if rid:
-            return get_image_blob_from_rid(shape.part, rid)
-    except Exception:
-        pass
-
-    return None
-
-
-def get_crop_rect_from_shape(shape) -> Tuple[float, float, float, float]:
-    try:
-        src_rect = find_descendant_by_localname(shape.element, "srcRect")
-        if src_rect is None:
-            return 0.0, 0.0, 0.0, 0.0
-
-        l = float(src_rect.get("l", "0")) / 100000.0
-        t = float(src_rect.get("t", "0")) / 100000.0
-        r = float(src_rect.get("r", "0")) / 100000.0
-        b = float(src_rect.get("b", "0")) / 100000.0
-        return l, t, r, b
-    except Exception:
-        return 0.0, 0.0, 0.0, 0.0
-
-
-def apply_crop_to_image(img: Image.Image, crop_rect: Tuple[float, float, float, float]) -> Image.Image:
-    l, t, r, b = crop_rect
-
-    if l < 0 or t < 0 or r < 0 or b < 0:
-        return img
-    if l >= 1 or t >= 1 or r >= 1 or b >= 1:
-        return img
-    if (l + r) >= 0.95 or (t + b) >= 0.95:
-        return img
-    if max(l, t, r, b) <= 0:
-        return img
-
-    w, h = img.size
-    left = int(round(w * l))
-    top = int(round(h * t))
-    right = int(round(w * (1 - r)))
-    bottom = int(round(h * (1 - b)))
-
-    left = max(0, min(left, w - 1))
-    top = max(0, min(top, h - 1))
-    right = max(left + 1, min(right, w))
-    bottom = max(top + 1, min(bottom, h))
-
-    if right - left < 5 or bottom - top < 5:
-        return img
-
-    return img.crop((left, top, right, bottom))
-
-
-def get_slide_background_image_blob(slide) -> Optional[bytes]:
-    try:
-        bg = find_descendant_by_localname(slide._element, "bg")
-        if bg is None:
-            return None
-
-        blip_fill = find_descendant_by_localname(bg, "blipFill")
-        if blip_fill is None:
-            return None
-
-        rid = get_blip_rid_from_element(blip_fill)
-        if not rid:
-            return None
-
-        return get_image_blob_from_rid(slide.part, rid)
-    except Exception:
-        return None
-
-
-# ============================================================
-# Internal links only
-# ============================================================
-
-def detect_internal_link_target(slides, slide_idx_zero: int, shape) -> Optional[int]:
-    try:
-        click_action = getattr(shape, "click_action", None)
-        if click_action is not None:
-            target_slide = getattr(click_action, "target_slide", None)
-            if target_slide is not None:
-                for i, s in enumerate(slides, start=1):
-                    if s == target_slide:
-                        return i
-    except Exception:
-        pass
-
-    try:
-        hlink_click = find_descendant_by_localname(shape.element, "hlinkClick")
-        if hlink_click is not None:
-            action = (hlink_click.get("action") or "").lower()
-            if "firstslide" in action:
-                return 1
-            if "lastslide" in action:
-                return len(slides)
-            if "nextslide" in action:
-                return min(len(slides), slide_idx_zero + 2)
-            if "previousslide" in action:
-                return max(1, slide_idx_zero)
-    except Exception:
-        pass
-
-    return None
-
-
-def hotspot_geometry_for_shape(shape, offset_x=0, offset_y=0) -> Dict[str, Any]:
-    x, y, w, h = shape_bounds(shape, offset_x, offset_y)
-    auto = get_auto_shape_type(shape)
-    shape_type = getattr(shape, "shape_type", None)
-
-    if shape_type == MSO_SHAPE_TYPE.LINE:
-        return {
-            "geom": "line",
-            "x1": x,
-            "y1": y,
-            "x2": x + w,
-            "y2": y + h,
-            "x": x,
-            "y": y,
-            "w": w,
-            "h": h,
-        }
-
-    if auto == MSO_AUTO_SHAPE_TYPE.OVAL:
-        return {"geom": "ellipse", "x": x, "y": y, "w": w, "h": h}
-
-    return {"geom": "rect", "x": x, "y": y, "w": w, "h": h}
-
-
-# ============================================================
-# Drawing
-# ============================================================
-
-def draw_line(draw, x1, y1, x2, y2, fill, width):
-    if width <= 0 or len(fill) == 4 and fill[3] == 0:
-        return
-    draw.line((x1, y1, x2, y2), fill=fill, width=width)
-
-
-def draw_rect(draw, x, y, w, h, fill, outline, width, radius=0):
-    x2, y2 = x + w, y + h
-    outline_arg = outline if width > 0 and not (len(outline) == 4 and outline[3] == 0) else None
-    width_arg = width if outline_arg is not None else 0
-
-    if radius > 0:
-        draw.rounded_rectangle((x, y, x2, y2), radius=radius, fill=fill, outline=outline_arg, width=width_arg)
-    else:
-        draw.rectangle((x, y, x2, y2), fill=fill, outline=outline_arg, width=width_arg)
-
-
-def draw_ellipse(draw, x, y, w, h, fill, outline, width):
-    outline_arg = outline if width > 0 and not (len(outline) == 4 and outline[3] == 0) else None
-    width_arg = width if outline_arg is not None else 0
-    draw.ellipse((x, y, x + w, y + h), fill=fill, outline=outline_arg, width=width_arg)
-
-
-def arrow_polygon_points(auto, x, y, w, h):
-    if auto == MSO_AUTO_SHAPE_TYPE.RIGHT_ARROW:
-        return [
-            (x, y + h * 0.25),
-            (x + w * 0.65, y + h * 0.25),
-            (x + w * 0.65, y),
-            (x + w, y + h * 0.5),
-            (x + w * 0.65, y + h),
-            (x + w * 0.65, y + h * 0.75),
-            (x, y + h * 0.75),
-        ]
-    if auto == MSO_AUTO_SHAPE_TYPE.LEFT_ARROW:
-        return [
-            (x + w, y + h * 0.25),
-            (x + w * 0.35, y + h * 0.25),
-            (x + w * 0.35, y),
-            (x, y + h * 0.5),
-            (x + w * 0.35, y + h),
-            (x + w * 0.35, y + h * 0.75),
-            (x + w, y + h * 0.75),
-        ]
-    if auto == MSO_AUTO_SHAPE_TYPE.UP_ARROW:
-        return [
-            (x + w * 0.25, y + h),
-            (x + w * 0.25, y + h * 0.35),
-            (x, y + h * 0.35),
-            (x + w * 0.5, y),
-            (x + w, y + h * 0.35),
-            (x + w * 0.75, y + h * 0.35),
-            (x + w * 0.75, y + h),
-        ]
-    if auto == MSO_AUTO_SHAPE_TYPE.DOWN_ARROW:
-        return [
-            (x + w * 0.25, y),
-            (x + w * 0.25, y + h * 0.65),
-            (x, y + h * 0.65),
-            (x + w * 0.5, y + h),
-            (x + w, y + h * 0.65),
-            (x + w * 0.75, y + h * 0.65),
-            (x + w * 0.75, y),
-        ]
-    return None
-
-
-def draw_text_box(draw, shape, scale: float, offset_x=0, offset_y=0):
-    text_frame = getattr(shape, "text_frame", None)
-    if text_frame is None:
-        return
-
-    x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
-    x = emu_to_px(x_emu, scale)
-    y = emu_to_px(y_emu, scale)
-    w = max(4, emu_to_px(w_emu, scale))
-    h = max(4, emu_to_px(h_emu, scale))
-
-    paragraphs = []
-    for para in text_frame.paragraphs:
-        txt = "".join(run.text or "" for run in para.runs).strip()
-        if txt:
-            paragraphs.append(txt)
-
-    if not paragraphs:
-        return
-
-    first_run = None
-    for para in text_frame.paragraphs:
-        if para.runs:
-            first_run = para.runs[0]
-            break
-
-    font_size = max(14, int(28 * scale))
-    font_bold = False
-    font_fill = (0, 0, 0, 255)
-
-    if first_run:
-        try:
-            fs = getattr(first_run.font, "size", None)
-            if fs is not None:
-                font_size = max(14, int(fs.pt * scale * 1.1))
-        except Exception:
-            pass
-        try:
-            font_bold = bool(getattr(first_run.font, "bold", False))
-        except Exception:
-            pass
-        try:
-            font_fill = color_to_rgb(first_run.font.color, default=(0, 0, 0)) + (255,)
-        except Exception:
-            pass
-
-    font = get_font(font_size, bold=font_bold)
-    line_gap = max(2, int(font_size * 0.2))
-
-    lines = []
-    for txt in paragraphs:
-        wrapped = fit_text_lines(draw, txt, font, max(10, w - 12))
-        lines.extend(wrapped if wrapped else [txt])
-
-    bbox = draw.textbbox((0, 0), "Ag", font=font)
-    line_h = max(1, bbox[3] - bbox[1])
-    total_h = len(lines) * line_h + max(0, len(lines) - 1) * line_gap
-    cy = y + max(4, (h - total_h) // 2)
-
-    for line in lines:
-        tw = draw.textlength(line, font=font)
-        tx = x + max(4, (w - tw) / 2)
-        draw.text((tx, cy), line, font=font, fill=font_fill)
-        cy += line_h + line_gap
-
-
-def draw_shape_object(draw, shape, scale: float, offset_x=0, offset_y=0):
-    x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
-    x = emu_to_px(x_emu, scale)
-    y = emu_to_px(y_emu, scale)
-    w = max(1, emu_to_px(w_emu, scale))
-    h = max(1, emu_to_px(h_emu, scale))
-
-    fill = shape_fill_rgba(shape)
-    outline = shape_line_rgba(shape)
-    width = shape_line_width_px(shape, scale)
-    auto = get_auto_shape_type(shape)
-    shape_type = getattr(shape, "shape_type", None)
-
-    if shape_type == MSO_SHAPE_TYPE.LINE:
-        draw_line(draw, x, y, x + w, y + h, outline, width)
-        return
-
-    if auto == MSO_AUTO_SHAPE_TYPE.RECTANGLE:
-        draw_rect(draw, x, y, w, h, fill, outline, width, radius=0)
-        return
-
-    if auto == MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE:
-        draw_rect(draw, x, y, w, h, fill, outline, width, radius=max(4, min(w, h) // 8))
-        return
-
-    if auto == MSO_AUTO_SHAPE_TYPE.OVAL:
-        draw_ellipse(draw, x, y, w, h, fill, outline, width)
-        return
-
-    pts = arrow_polygon_points(auto, x, y, w, h)
-    if pts:
-        outline_arg = outline if width > 0 and not (len(outline) == 4 and outline[3] == 0) else None
-        draw.polygon(pts, fill=fill, outline=outline_arg)
-        return
-
-    if auto is not None:
-        draw_rect(draw, x, y, w, h, fill, outline, width, radius=0)
-
-
-def paste_image_into_box(canvas: Image.Image, img: Image.Image, x: int, y: int, w: int, h: int):
-    if w <= 0 or h <= 0:
-        return
-    img = img.resize((w, h))
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    canvas.alpha_composite(img, (x, y))
-
-
-def paste_picture(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y=0):
-    try:
-        blob = get_picture_blob_from_shape(shape)
-        if not blob:
-            return False
-
-        x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
-        x = emu_to_px(x_emu, scale)
-        y = emu_to_px(y_emu, scale)
-        w = max(1, emu_to_px(w_emu, scale))
-        h = max(1, emu_to_px(h_emu, scale))
-
-        original = Image.open(io.BytesIO(blob)).convert("RGBA")
-
-        try:
-            cropped = apply_crop_to_image(original.copy(), get_crop_rect_from_shape(shape))
-            cw, ch = cropped.size
-            if cw < 10 or ch < 10:
-                cropped = original
-        except Exception:
-            cropped = original
-
-        paste_image_into_box(canvas, cropped, x, y, w, h)
-        return True
-    except Exception:
-        return False
-
-
-def paste_slide_background(canvas: Image.Image, slide):
-    try:
-        blob = get_slide_background_image_blob(slide)
-        if not blob:
-            return False
-        img = Image.open(io.BytesIO(blob)).convert("RGBA")
-        paste_image_into_box(canvas, img, 0, 0, canvas.width, canvas.height)
-        return True
-    except Exception:
-        return False
-
-
-def render_shape_recursive(canvas: Image.Image, draw: ImageDraw.ImageDraw, shape, scale: float, offset_x=0, offset_y=0):
-    shape_type = getattr(shape, "shape_type", None)
-
-    if shape_type == MSO_SHAPE_TYPE.GROUP:
-        gx, gy, _, _ = shape_bounds(shape, offset_x, offset_y)
-        try:
-            for child in shape.shapes:
-                render_shape_recursive(canvas, draw, child, scale, gx, gy)
-        except Exception:
-            pass
-        return
-
-    is_picture = False
-    try:
-        if get_picture_blob_from_shape(shape):
-            pasted = paste_picture(canvas, shape, scale, offset_x, offset_y)
-            is_picture = bool(pasted)
-    except Exception:
-        is_picture = False
-
-    try:
-        if not is_picture:
-            draw_shape_object(draw, shape, scale, offset_x, offset_y)
-    except Exception:
-        pass
-
-    try:
-        if getattr(shape, "has_text_frame", False):
-            draw_text_box(draw, shape, scale, offset_x, offset_y)
-    except Exception:
-        pass
-
-
-def render_slide_to_png(slide, prs: Presentation) -> bytes:
-    slide_w = int(prs.slide_width)
-    slide_h = int(prs.slide_height)
-    scale = CANVAS_W / slide_w
-    canvas_h = max(1, int(round(slide_h * scale)))
-
-    canvas = Image.new("RGBA", (CANVAS_W, canvas_h), (255, 255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
-
-    paste_slide_background(canvas, slide)
-
-    for shape in slide.shapes:
-        render_shape_recursive(canvas, draw, shape, scale)
-
-    out = io.BytesIO()
-    canvas.save(out, format="PNG")
-    return out.getvalue()
-
-
-# ============================================================
-# Collect hotspots / course data
-# ============================================================
-
-def collect_hotspots_recursive(shape, prs, slide_idx_zero: int, hotspots: List[Dict[str, Any]], offset_x=0, offset_y=0):
-    shape_type = getattr(shape, "shape_type", None)
-
-    if shape_type == MSO_SHAPE_TYPE.GROUP:
-        gx, gy, _, _ = shape_bounds(shape, offset_x, offset_y)
-        try:
-            for child in shape.shapes:
-                collect_hotspots_recursive(child, prs, slide_idx_zero, hotspots, gx, gy)
-        except Exception:
-            pass
-        return
-
-    try:
-        internal = detect_internal_link_target(prs.slides, slide_idx_zero, shape)
-        if internal is not None:
-            geom = hotspot_geometry_for_shape(shape, offset_x, offset_y)
-            geom = {**geom, "kind": "internal", "target_slide": internal}
-            hotspots.append(geom)
-    except Exception:
-        pass
-
-
-def extract_course(prs: Presentation) -> Tuple[Dict[str, Any], Dict[str, bytes]]:
-    media: Dict[str, bytes] = {}
-    slides_out = []
-
-    for s_idx, slide in enumerate(prs.slides, start=1):
-        slide_img_name = f"slides/slide_{s_idx:03d}.png"
-        media[slide_img_name] = render_slide_to_png(slide, prs)
-
-        hotspots: List[Dict[str, Any]] = []
-        for shape in slide.shapes:
-            collect_hotspots_recursive(shape, prs, s_idx - 1, hotspots, 0, 0)
-
-        slides_out.append({
-            "index": s_idx,
-            "image": slide_img_name,
-            "hotspots": hotspots,
-        })
-
-    course = {
-        "slideWidthEmu": int(prs.slide_width),
-        "slideHeightEmu": int(prs.slide_height),
-        "slides": slides_out,
-    }
-    return course, media
-
-
-# ============================================================
-# SCORM / player
-# ============================================================
-
-def build_scorm_driver_js() -> str:
-    return """
-var scormAPI = null;
-
-function findAPI(win) {
-  var tries = 0;
-  while ((win.API == null) && (win.parent != null) && (win.parent != win)) {
-    tries++;
-    if (tries > 20) return null;
-    win = win.parent;
-  }
-  return win.API;
-}
-
-function getAPI() {
-  if (scormAPI == null) scormAPI = findAPI(window);
-  return scormAPI;
-}
-
-function scormInitialize() {
-  var api = getAPI();
-  if (api) return api.LMSInitialize("");
-  return false;
-}
-
-function scormTerminate() {
-  var api = getAPI();
-  if (api) return api.LMSFinish("");
-  return false;
-}
-
-function scormGetValue(key) {
-  var api = getAPI();
-  if (api) return api.LMSGetValue(key);
-  return "";
-}
-
-function scormSetValue(key, value) {
-  var api = getAPI();
-  if (api) return api.LMSSetValue(key, value);
-  return false;
-}
-
-function scormCommit() {
-  var api = getAPI();
-  if (api) return api.LMSCommit("");
-  return false;
-}
+    def slide_sort_key(path: Path):
+        name = path.stem.lower()
+        nums = re.findall(r"\d+", name)
+        if nums:
+            return int(nums[-1])
+        return 10**9
+
+    pngs = sorted(pngs, key=slide_sort_key)
+
+    # If count matches, great
+    if len(pngs) >= expected_count:
+        return pngs[:expected_count]
+
+    return pngs
+
+
+def export_slide_images(pptx_path: str, work_dir: str, expected_count: int) -> list[Path]:
+    """
+    Priority:
+    1. Windows PowerPoint COM export for best fidelity
+    2. LibreOffice export
+    """
+    export_dir = os.path.join(work_dir, "slide_exports")
+    os.makedirs(export_dir, exist_ok=True)
+
+    ok = export_slides_with_powerpoint_windows(pptx_path, export_dir)
+    if not ok:
+        ok = export_slides_with_libreoffice(pptx_path, export_dir)
+
+    if not ok:
+        raise RuntimeError(
+            "Could not export slide images. Install Microsoft PowerPoint on Windows "
+            "or LibreOffice for headless export."
+        )
+
+    images = collect_exported_slide_images(export_dir, expected_count)
+    if not images:
+        raise RuntimeError("Slide image export finished, but no PNG slide images were found.")
+
+    return images
+
+
+def image_to_base64(path: Path) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def write_text(path: str, content: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def build_player_html(
+    title: str,
+    slide_width_px: int,
+    slide_height_px: int,
+    image_files: list[str],
+    hotspots_by_slide: list[dict],
+) -> str:
+    images_json = json.dumps(image_files)
+    hotspots_json = json.dumps(hotspots_by_slide)
+
+    safe_title = html.escape(title)
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_title}</title>
+  <style>
+    :root {{
+      --bg: #111;
+      --panel: #1b1b1b;
+      --text: #fff;
+      --muted: #ccc;
+      --btn: #2b2b2b;
+      --btn-hover: #3a3a3a;
+      --accent: #4da3ff;
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    html, body {{
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, Helvetica, sans-serif;
+      overflow: hidden;
+    }}
+
+    .app {{
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      height: 100%;
+    }}
+
+    .topbar {{
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 14px 18px;
+      background: rgba(0,0,0,0.45);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      z-index: 10;
+    }}
+
+    .topbar button {{
+      background: var(--btn);
+      color: var(--text);
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 18px;
+      font-size: 18px;
+      cursor: pointer;
+      min-width: 110px;
+    }}
+
+    .topbar button:hover {{
+      background: var(--btn-hover);
+    }}
+
+    .topbar button:disabled {{
+      opacity: 0.45;
+      cursor: not-allowed;
+    }}
+
+    .slide-count {{
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      min-width: 150px;
+      text-align: center;
+    }}
+
+    .stage-wrap {{
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+    }}
+
+    .stage {{
+      position: relative;
+      width: min(calc(100vw - 36px), calc((100vh - 110px) * {slide_width_px / slide_height_px:.8f}));
+      aspect-ratio: {slide_width_px} / {slide_height_px};
+      max-height: calc(100vh - 110px);
+      background: #000;
+      overflow: hidden;
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    }}
+
+    .slide-image {{
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      user-select: none;
+      -webkit-user-drag: none;
+    }}
+
+    .hotspot {{
+      position: absolute;
+      background: transparent;
+      border: none;
+      outline: none;
+      cursor: pointer;
+      padding: 0;
+      margin: 0;
+    }}
+
+    .hotspot:focus {{
+      outline: 2px solid rgba(77,163,255,0.7);
+      outline-offset: -2px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <button id="prevBtn" type="button">◀ Prev</button>
+      <div id="slideCount" class="slide-count">1 / 1</div>
+      <button id="nextBtn" type="button">Next ▶</button>
+    </div>
+
+    <div class="stage-wrap">
+      <div id="stage" class="stage">
+        <img id="slideImage" class="slide-image" alt="Slide">
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const images = {images_json};
+    const hotspotsBySlide = {hotspots_json};
+    const slideWidth = {slide_width_px};
+    const slideHeight = {slide_height_px};
+
+    let current = 0;
+
+    const slideImage = document.getElementById("slideImage");
+    const stage = document.getElementById("stage");
+    const slideCount = document.getElementById("slideCount");
+    const prevBtn = document.getElementById("prevBtn");
+    const nextBtn = document.getElementById("nextBtn");
+
+    function clamp(n, min, max) {{
+      return Math.max(min, Math.min(max, n));
+    }}
+
+    function render() {{
+      current = clamp(current, 0, images.length - 1);
+      slideImage.src = images[current];
+      slideCount.textContent = `${{current + 1}} / ${{images.length}}`;
+      prevBtn.disabled = current === 0;
+      nextBtn.disabled = current === images.length - 1;
+
+      [...stage.querySelectorAll(".hotspot")].forEach(el => el.remove());
+
+      const entry = hotspotsBySlide.find(s => s.slide === current + 1);
+      if (!entry || !entry.hotspots) return;
+
+      for (const h of entry.hotspots) {{
+        const btn = document.createElement("button");
+        btn.className = "hotspot";
+        btn.type = "button";
+        btn.setAttribute("aria-label", `Go to slide ${{h.target}}`);
+
+        btn.style.left = `${{(h.x / slideWidth) * 100}}%`;
+        btn.style.top = `${{(h.y / slideHeight) * 100}}%`;
+        btn.style.width = `${{(h.w / slideWidth) * 100}}%`;
+        btn.style.height = `${{(h.h / slideHeight) * 100}}%`;
+
+        btn.addEventListener("click", () => {{
+          current = h.target - 1;
+          render();
+        }});
+
+        stage.appendChild(btn);
+      }}
+    }}
+
+    prevBtn.addEventListener("click", () => {{
+      if (current > 0) {{
+        current -= 1;
+        render();
+      }}
+    }});
+
+    nextBtn.addEventListener("click", () => {{
+      if (current < images.length - 1) {{
+        current += 1;
+        render();
+      }}
+    }});
+
+    document.addEventListener("keydown", (e) => {{
+      if (e.key === "ArrowLeft") {{
+        if (current > 0) {{
+          current -= 1;
+          render();
+        }}
+      }} else if (e.key === "ArrowRight") {{
+        if (current < images.length - 1) {{
+          current += 1;
+          render();
+        }}
+      }}
+    }});
+
+    render();
+  </script>
+</body>
+</html>
 """
 
 
-def build_manifest_xml(course_id: str, title: str, media_files: List[str]) -> str:
-    media_xml = "\n".join([f'      <file href="{name}" />' for name in media_files])
+def build_scorm_api_js() -> str:
+    return r"""
+var scormData = {
+  "cmi.core.lesson_status": "not attempted",
+  "cmi.core.score.raw": "",
+  "cmi.core.student_name": "Learner",
+  "cmi.core.student_id": "0001"
+};
+
+function LMSInitialize(param) { return "true"; }
+function LMSFinish(param) { return "true"; }
+function LMSGetValue(key) {
+  return scormData[key] || "";
+}
+function LMSSetValue(key, value) {
+  scormData[key] = value;
+  return "true";
+}
+function LMSCommit(param) { return "true"; }
+function LMSGetLastError() { return "0"; }
+function LMSGetErrorString(code) { return "No error"; }
+function LMSGetDiagnostic(code) { return "No diagnostic"; }
+
+var API = {
+  LMSInitialize: LMSInitialize,
+  LMSFinish: LMSFinish,
+  LMSGetValue: LMSGetValue,
+  LMSSetValue: LMSSetValue,
+  LMSCommit: LMSCommit,
+  LMSGetLastError: LMSGetLastError,
+  LMSGetErrorString: LMSGetErrorString,
+  LMSGetDiagnostic: LMSGetDiagnostic
+};
+"""
+
+
+def build_scorm_launcher_html(course_title: str) -> str:
+    safe_title = html.escape(course_title)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{safe_title}</title>
+  <script src="scorm_api.js"></script>
+  <script>
+    window.onload = function() {{
+      try {{
+        API.LMSInitialize("");
+        API.LMSSetValue("cmi.core.lesson_status", "incomplete");
+        API.LMSCommit("");
+      }} catch (e) {{}}
+    }};
+
+    window.onbeforeunload = function() {{
+      try {{
+        API.LMSSetValue("cmi.core.lesson_status", "completed");
+        API.LMSCommit("");
+        API.LMSFinish("");
+      }} catch (e) {{}}
+    };
+  </script>
+</head>
+<frameset rows="100%" border="0">
+  <frame src="player.html" name="content_frame" frameborder="0" />
+</frameset>
+</html>
+"""
+
+
+def build_manifest_xml(course_id: str, course_title: str) -> str:
+    safe_title = html.escape(course_title)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", course_id)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
-<manifest identifier="{course_id}"
-    version="1.0"
-    xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
-    xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_rootv1p2"
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:schemaLocation="http://www.imsproject.org/xsd/imscp_rootv1p1p2 imscp_rootv1p1p2.xsd
-    http://www.adlnet.org/xsd/adlcp_rootv1p2 adlcp_rootv1p2.xsd">
+<manifest identifier="{safe_id}"
+          version="1.0"
+          xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+          xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_rootv1p2"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="
+            http://www.imsproject.org/xsd/imscp_rootv1p1p2 imscp_rootv1p1p2.xsd
+            http://www.adlnet.org/xsd/adlcp_rootv1p2 adlcp_rootv1p2.xsd">
   <metadata>
     <schema>ADL SCORM</schema>
     <schemaversion>1.2</schemaversion>
   </metadata>
+
   <organizations default="ORG1">
     <organization identifier="ORG1">
-      <title>{html.escape(title)}</title>
-      <item identifier="ITEM1" identifierref="RES1">
-        <title>{html.escape(title)}</title>
+      <title>{safe_title}</title>
+      <item identifier="ITEM1" identifierref="RES1" isvisible="true">
+        <title>{safe_title}</title>
       </item>
     </organization>
   </organizations>
+
   <resources>
-    <resource identifier="RES1" type="webcontent" adlcp:scormtype="sco" href="index_lms.html">
-      <file href="index_lms.html" />
-      <file href="scormdriver.js" />
-{media_xml}
+    <resource identifier="RES1"
+              type="webcontent"
+              adlcp:scormtype="sco"
+              href="index.html">
+      <file href="index.html"/>
+      <file href="player.html"/>
+      <file href="scorm_api.js"/>
     </resource>
   </resources>
-</manifest>"""
+</manifest>
+"""
 
 
-def build_player_html(title: str, course: Dict[str, Any], show_nav: bool) -> str:
-    data = json.dumps(course, ensure_ascii=False)
-    sidebar_style = "" if show_nav else "display:none;"
-    bottombar_style = "display:flex;" if show_nav else "display:none;"
+def create_scorm_package(uploaded_file, course_title: str) -> bytes:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        pptx_path = tmpdir_path / "input.pptx"
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{html.escape(title)}</title>
-<style>
-* {{
-  box-sizing: border-box;
-}}
-body {{
-  margin: 0;
-  font-family: Arial, sans-serif;
-  background: #111;
-  color: #f1f1f1;
-  min-height: 100vh;
-}}
-.app {{
-  display: flex;
-  min-height: 100vh;
-}}
-.sidebar {{
-  width: 130px;
-  background: #1a1a1a;
-  border-right: 1px solid #333;
-  padding: 16px 10px;
-  {sidebar_style}
-}}
-.sidebar label {{
-  display: block;
-  font-size: 13px;
-  color: #bbb;
-  margin-bottom: 8px;
-}}
-.sidebar select {{
-  width: 100%;
-  height: calc(100vh - 40px);
-  min-height: 260px;
-  background: #262626;
-  color: #f1f1f1;
-  border: 1px solid #444;
-  border-radius: 8px;
-  padding: 8px;
-}}
-.main {{
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-}}
-.header {{
-  background: #1a1a1a;
-  border-bottom: 1px solid #333;
-  padding: 12px 16px;
-}}
-.header-title {{
-  font-weight: 700;
-}}
-.header-sub {{
-  color: #bbb;
-  font-size: 14px;
-  margin-top: 4px;
-}}
-.stage-wrap {{
-  flex: 1;
-  display: grid;
-  place-items: center;
-  padding: 18px;
-}}
-.frame {{
-  width: min(100%, 1280px);
-  aspect-ratio: 16 / 9;
-  position: relative;
-  background: white;
-  overflow: hidden;
-  border-radius: 10px;
-  box-shadow: 0 14px 40px rgba(0,0,0,.45);
-}}
-.slide-image {{
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}}
-.hotspot-layer {{
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}}
-.hotspot {{
-  position: absolute;
-  display: block;
-  background: rgba(0,0,0,0);
-  pointer-events: auto;
-}}
-.hotspot.ellipse {{
-  border-radius: 50%;
-}}
-.bottom-bar {{
-  background: #1a1a1a;
-  border-top: 1px solid #333;
-  padding: 12px 16px;
-  justify-content: center;
-  gap: 12px;
-  {bottombar_style}
-}}
-.bottom-bar button {{
-  background: #262626;
-  color: #f1f1f1;
-  border: 1px solid #444;
-  border-radius: 8px;
-  padding: 10px 16px;
-  cursor: pointer;
-  min-width: 100px;
-}}
-</style>
-</head>
-<body>
-<div class="app">
-  <aside class="sidebar">
-    <label for="jumpSelect">Slides</label>
-    <select id="jumpSelect" size="20" onchange="jumpSlide(this.value)"></select>
-  </aside>
+        with open(pptx_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-  <div class="main">
-    <div class="header">
-      <div class="header-title">{html.escape(title)}</div>
-      <div class="header-sub" id="counter">Slide 1</div>
-    </div>
+        prs = Presentation(str(pptx_path))
+        slide_width_px = int(round(px_from_emu(prs.slide_width)))
+        slide_height_px = int(round(px_from_emu(prs.slide_height)))
+        hotspots = extract_internal_hotspots(prs)
 
-    <div class="stage-wrap">
-      <div class="frame">
-        <img id="slideImage" class="slide-image" alt="Slide" />
-        <div class="hotspot-layer" id="hotspotLayer"></div>
-      </div>
-    </div>
+        exported_images = export_slide_images(str(pptx_path), tmpdir, len(prs.slides))
 
-    <div class="bottom-bar">
-      <button onclick="prevSlide()">Previous</button>
-      <button onclick="nextSlide()">Next</button>
-    </div>
-  </div>
-</div>
+        package_dir = tmpdir_path / "scorm_package"
+        assets_dir = package_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
 
-<script src="scormdriver.js"></script>
-<script>
-const course = {data};
-let currentSlide = 1;
+        image_files = []
+        for idx, src in enumerate(exported_images, start=1):
+            ext = src.suffix.lower() or ".png"
+            dst_name = f"slide_{idx:03d}{ext}"
+            dst = assets_dir / dst_name
+            shutil.copy2(src, dst)
+            image_files.append(f"assets/{dst_name}")
 
-const slideImage = document.getElementById("slideImage");
-const hotspotLayer = document.getElementById("hotspotLayer");
-const counter = document.getElementById("counter");
-const jumpSelect = document.getElementById("jumpSelect");
-
-function pct(value, total) {{
-  return (value / total) * 100;
-}}
-
-function populateJumpMenu() {{
-  if (!jumpSelect) return;
-  jumpSelect.innerHTML = "";
-  for (const slide of course.slides) {{
-    const opt = document.createElement("option");
-    opt.value = slide.index;
-    opt.textContent = `Slide ${{slide.index}}`;
-    jumpSelect.appendChild(opt);
-  }}
-}}
-
-function createHotspot(link) {{
-  const el = document.createElement("div");
-  el.className = "hotspot";
-  el.style.cursor = "pointer";
-
-  if (link.geom === "ellipse") {{
-    el.classList.add("ellipse");
-    el.style.left = pct(link.x, course.slideWidthEmu) + "%";
-    el.style.top = pct(link.y, course.slideHeightEmu) + "%";
-    el.style.width = pct(link.w, course.slideWidthEmu) + "%";
-    el.style.height = pct(link.h, course.slideHeightEmu) + "%";
-  }} else if (link.geom === "line") {{
-    const x1p = pct(link.x1, course.slideWidthEmu);
-    const y1p = pct(link.y1, course.slideHeightEmu);
-    const x2p = pct(link.x2, course.slideWidthEmu);
-    const y2p = pct(link.y2, course.slideHeightEmu);
-
-    const dx = x2p - x1p;
-    const dy = y2p - y1p;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-
-    el.style.left = x1p + "%";
-    el.style.top = y1p + "%";
-    el.style.width = len + "%";
-    el.style.height = "2%";
-    el.style.transformOrigin = "0 50%";
-    el.style.transform = `translateY(-50%) rotate(${{angle}}deg)`;
-  }} else {{
-    el.style.left = pct(link.x, course.slideWidthEmu) + "%";
-    el.style.top = pct(link.y, course.slideHeightEmu) + "%";
-    el.style.width = pct(link.w, course.slideWidthEmu) + "%";
-    el.style.height = pct(link.h, course.slideHeightEmu) + "%";
-  }}
-
-  el.addEventListener("click", function(e) {{
-    e.preventDefault();
-    e.stopPropagation();
-    if (link.target_slide) {{
-      goToSlide(Number(link.target_slide));
-    }}
-  }});
-
-  return el;
-}}
-
-function renderHotspots(slide) {{
-  hotspotLayer.innerHTML = "";
-  for (const link of slide.hotspots || []) {{
-    const el = createHotspot(link);
-    if (el) hotspotLayer.appendChild(el);
-  }}
-}}
-
-function setScormState() {{
-  if (!window.scormSetValue) return;
-  try {{
-    window.scormSetValue("cmi.core.lesson_location", String(currentSlide));
-    const progress = Math.round((currentSlide / course.slides.length) * 100);
-    window.scormSetValue("cmi.core.score.raw", String(progress));
-    window.scormSetValue("cmi.core.lesson_status", currentSlide >= course.slides.length ? "completed" : "incomplete");
-    window.scormCommit();
-  }} catch (e) {{}}
-}}
-
-function goToSlide(num) {{
-  if (num < 1 || num > course.slides.length) return;
-  currentSlide = num;
-  const slide = course.slides[currentSlide - 1];
-  slideImage.src = slide.image;
-  renderHotspots(slide);
-
-  counter.textContent = `Slide ${{currentSlide}} of ${{course.slides.length}}`;
-  if (jumpSelect) jumpSelect.value = String(currentSlide);
-  setScormState();
-}}
-
-function nextSlide() {{
-  if (currentSlide < course.slides.length) goToSlide(currentSlide + 1);
-}}
-
-function prevSlide() {{
-  if (currentSlide > 1) goToSlide(currentSlide - 1);
-}}
-
-function jumpSlide(value) {{
-  const num = Number(value);
-  if (!Number.isNaN(num)) goToSlide(num);
-}}
-
-document.addEventListener("keydown", function(e) {{
-  if (e.key === "ArrowRight") nextSlide();
-  if (e.key === "ArrowLeft") prevSlide();
-}});
-
-window.addEventListener("load", function() {{
-  populateJumpMenu();
-  if (window.scormInitialize) {{
-    try {{
-      window.scormInitialize();
-      const saved = window.scormGetValue("cmi.core.lesson_location");
-      const n = parseInt(saved || "1", 10);
-      if (!Number.isNaN(n) && n >= 1 && n <= course.slides.length) currentSlide = n;
-    }} catch (e) {{}}
-  }}
-  goToSlide(currentSlide);
-}});
-
-window.addEventListener("beforeunload", function() {{
-  if (window.scormTerminate) {{
-    try {{ window.scormTerminate(); }} catch (e) {{}}
-  }}
-}});
-</script>
-</body>
-</html>"""
-
-
-# ============================================================
-# Build ZIP
-# ============================================================
-
-def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str, show_nav: bool):
-    prs = Presentation(io.BytesIO(pptx_bytes))
-    course, media = extract_course(prs)
-
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, blob in media.items():
-            zf.writestr(name, blob)
-
-        zf.writestr("index_lms.html", build_player_html(course_title, course, show_nav=show_nav))
-        zf.writestr("scormdriver.js", build_scorm_driver_js())
-        zf.writestr(
-            "imsmanifest.xml",
-            build_manifest_xml(
-                f"{safe_name(course_title)}_{uuid.uuid4().hex[:8]}",
-                course_title,
-                sorted(media.keys()),
-            ),
+        player_html = build_player_html(
+            title=course_title,
+            slide_width_px=slide_width_px,
+            slide_height_px=slide_height_px,
+            image_files=image_files,
+            hotspots_by_slide=hotspots,
         )
 
-    mem.seek(0)
-    out_name = f"{safe_name(Path(pptx_name).stem)}_scorm12.zip"
-    summary = {
-        "slides": len(prs.slides),
-        "assets": len(media),
-    }
-    return mem.read(), out_name, summary
+        write_text(str(package_dir / "player.html"), player_html)
+        write_text(str(package_dir / "scorm_api.js"), build_scorm_api_js())
+        write_text(str(package_dir / "index.html"), build_scorm_launcher_html(course_title))
+        write_text(str(package_dir / "imsmanifest.xml"), build_manifest_xml("ppt_to_scorm_course", course_title))
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(package_dir):
+                for file in files:
+                    abs_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(abs_path, package_dir)
+                    zf.write(abs_path, rel_path)
+
+        zip_buffer.seek(0)
+        return zip_buffer.read()
 
 
-# ============================================================
-# Streamlit UI
-# ============================================================
+# =========================
+# UI
+# =========================
+uploaded = st.file_uploader("Upload PowerPoint (.pptx)", type=["pptx"])
+default_name = "ppt_scorm_package"
 
-st.set_page_config(page_title=APP_TITLE, layout="centered")
-st.title(APP_TITLE)
-st.caption("Pure-Python MVP: PPTX → static slide images + internal-link hotspots → SCORM 1.2 ZIP")
+col1, col2 = st.columns([2, 1])
+with col1:
+    package_name = st.text_input("Package name", value=default_name)
+with col2:
+    course_title = st.text_input("Course title", value="PPT Course")
 
-with st.expander("What this version supports"):
-    st.markdown(
-        """
-- Static slide image rendering in Python
-- Normal inserted pictures
-- Cropped pictures
-- Slide background images
-- Larger rendered text
-- Basic shapes: circles/ovals, rectangles, rounded rectangles, lines, simple arrows
-- Internal slide-jump hotspots
-- HTML hotspot overlays
-- Optional built-in navigation
-        """
-    )
+st.caption("Best fidelity is on Windows with Microsoft PowerPoint installed. LibreOffice is used as fallback.")
 
-course_title = st.text_input("Course title", value="My SCORM Course")
-uploaded = st.file_uploader("Upload PPTX", type=["pptx"])
-show_nav = st.checkbox("Show built-in navigation", value=True)
+if uploaded is not None:
+    st.success(f"Loaded: {uploaded.name}")
 
-if st.button("Publish SCORM", type="primary", use_container_width=True):
-    if not uploaded:
-        st.error("Please upload a .pptx file first.")
-    else:
+    if st.button("Publish SCORM package", type="primary"):
         try:
-            zip_bytes, zip_name, summary = build_scorm_zip(
-                uploaded.getvalue(),
-                uploaded.name,
-                course_title,
-                show_nav,
-            )
-            st.success("SCORM package created.")
-            st.write(f"Slides detected: {summary['slides']}")
-            st.write(f"Generated assets: {summary['assets']}")
+            output_bytes = create_scorm_package(uploaded, course_title=course_title.strip() or "PPT Course")
+            safe_name = sanitize_filename(package_name) + ".zip"
+
+            st.success("SCORM package created successfully.")
             st.download_button(
-                "Download SCORM ZIP",
-                data=zip_bytes,
-                file_name=zip_name,
+                label="Download SCORM ZIP",
+                data=output_bytes,
+                file_name=safe_name,
                 mime="application/zip",
-                use_container_width=True,
             )
+
         except Exception as e:
             st.error(f"Failed to publish SCORM package: {e}")
-
-st.divider()
-st.subheader("requirements.txt")
-st.code("streamlit\npython-pptx\nlxml\nPillow\n")
