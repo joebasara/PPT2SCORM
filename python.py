@@ -1,6 +1,7 @@
 import html
 import io
 import json
+import math
 import re
 import uuid
 import zipfile
@@ -8,15 +9,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 from pptx import Presentation
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_SHAPE_TYPE
-from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 
 APP_TITLE = "PPTX to SCORM Publisher"
+CANVAS_W = 1600
 
 
 # ============================================================
-# General helpers
+# Helpers
 # ============================================================
 
 def safe_name(value: str) -> str:
@@ -24,10 +26,11 @@ def safe_name(value: str) -> str:
     return value.strip("._-") or "course"
 
 
-def emu_pct(value: float, total: float) -> float:
-    if not total:
-        return 0.0
-    return (value / total) * 100.0
+def get_auto_shape_type(shape):
+    try:
+        return shape.auto_shape_type
+    except Exception:
+        return None
 
 
 def shape_bounds(shape, offset_x: int = 0, offset_y: int = 0) -> Tuple[int, int, int, int]:
@@ -39,85 +42,99 @@ def shape_bounds(shape, offset_x: int = 0, offset_y: int = 0) -> Tuple[int, int,
     )
 
 
-def color_to_hex(color_obj) -> Optional[str]:
+def color_to_rgb(color_obj, default=(0, 0, 0)):
     try:
         rgb = getattr(color_obj, "rgb", None)
         if rgb:
-            return f"#{rgb}"
+            s = str(rgb)
+            return tuple(int(s[i:i+2], 16) for i in (0, 2, 4))
     except Exception:
         pass
-    return None
+    return default
 
 
-def get_auto_shape_type(shape):
-    try:
-        return shape.auto_shape_type
-    except Exception:
-        return None
-
-
-def shape_fill_color(shape) -> str:
+def shape_fill_rgb(shape, default=(255, 255, 255, 0)):
     try:
         fill = shape.fill
         fc = fill.fore_color
-        color = color_to_hex(fc)
-        if color:
-            return color
+        rgb = getattr(fc, "rgb", None)
+        if rgb:
+            s = str(rgb)
+            return tuple(int(s[i:i+2], 16) for i in (0, 2, 4)) + (255,)
     except Exception:
         pass
-    return "transparent"
+    return default
 
 
-def shape_line_color(shape) -> str:
+def shape_line_rgb(shape, default=(0, 0, 0, 255)):
     try:
         line = shape.line
-        color = color_to_hex(line.color)
-        if color:
-            return color
+        c = line.color
+        rgb = getattr(c, "rgb", None)
+        if rgb:
+            s = str(rgb)
+            return tuple(int(s[i:i+2], 16) for i in (0, 2, 4)) + (255,)
     except Exception:
         pass
-    return "#000000"
+    return default
 
 
-def shape_line_width_px(shape) -> float:
+def shape_line_width_px(shape, scale: float) -> int:
     try:
         width_emu = float(shape.line.width)
-        px = width_emu / 12700.0
-        return max(px, 1.0)
+        px = int(max(1, round((width_emu / 12700.0) * scale)))
+        return px
     except Exception:
-        return 1.5
+        return max(1, int(round(2 * scale)))
 
 
-def paragraph_align_to_css(paragraph) -> str:
-    try:
-        align = paragraph.alignment
-        if align == PP_ALIGN.CENTER:
-            return "center"
-        if align == PP_ALIGN.RIGHT:
-            return "right"
-        if align == PP_ALIGN.JUSTIFY:
-            return "justify"
-    except Exception:
-        pass
-    return "left"
+def emu_to_px(value: float, scale: float) -> int:
+    return int(round(value * scale))
 
 
-def vertical_anchor_to_css(text_frame, default_center: bool = False) -> str:
-    try:
-        va = text_frame.vertical_anchor
-        if va == MSO_ANCHOR.TOP:
-            return "flex-start"
-        if va == MSO_ANCHOR.MIDDLE:
-            return "center"
-        if va == MSO_ANCHOR.BOTTOM:
-            return "flex-end"
-    except Exception:
-        pass
-    return "center" if default_center else "flex-start"
+def fit_text_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    lines = []
+    current = words[0]
+    for w in words[1:]:
+        trial = current + " " + w
+        if draw.textlength(trial, font=font) <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = w
+    lines.append(current)
+    return lines
+
+
+def get_font(size_px: int, bold: bool = False):
+    candidates = []
+    if bold:
+        candidates = [
+            "arialbd.ttf",
+            "Arial Bold.ttf",
+            "DejaVuSans-Bold.ttf",
+        ]
+    else:
+        candidates = [
+            "arial.ttf",
+            "Arial.ttf",
+            "DejaVuSans.ttf",
+        ]
+
+    for name in candidates:
+        try:
+            return ImageFont.truetype(name, size_px)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 # ============================================================
-# Hyperlink detection
+# Hyperlinks / hotspots
 # ============================================================
 
 def extract_shape_external_link(shape) -> Optional[str]:
@@ -164,11 +181,54 @@ def detect_internal_link_target(slides, slide_idx_zero: int, shape) -> Optional[
     return None
 
 
+def hotspot_geometry_for_shape(shape, offset_x=0, offset_y=0) -> Dict[str, Any]:
+    x, y, w, h = shape_bounds(shape, offset_x, offset_y)
+    auto = get_auto_shape_type(shape)
+    shape_type = getattr(shape, "shape_type", None)
+
+    if shape_type == MSO_SHAPE_TYPE.LINE:
+        return {
+            "geom": "line",
+            "x1": x,
+            "y1": y,
+            "x2": x + w,
+            "y2": y + h,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+        }
+
+    if auto == MSO_AUTO_SHAPE_TYPE.OVAL:
+        return {"geom": "ellipse", "x": x, "y": y, "w": w, "h": h}
+
+    if auto in (MSO_AUTO_SHAPE_TYPE.RECTANGLE, MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE):
+        return {"geom": "rect", "x": x, "y": y, "w": w, "h": h}
+
+    return {"geom": "rect", "x": x, "y": y, "w": w, "h": h}
+
+
 # ============================================================
-# Shape-aware hotspot geometry
+# Drawing
 # ============================================================
 
-def arrow_polygon_points(auto, x, y, w, h) -> Optional[List[Tuple[float, float]]]:
+def draw_line(draw, x1, y1, x2, y2, fill, width):
+    draw.line((x1, y1, x2, y2), fill=fill, width=width)
+
+
+def draw_rect(draw, x, y, w, h, fill, outline, width, radius=0):
+    x2, y2 = x + w, y + h
+    if radius > 0:
+        draw.rounded_rectangle((x, y, x2, y2), radius=radius, fill=fill, outline=outline, width=width)
+    else:
+        draw.rectangle((x, y, x2, y2), fill=fill, outline=outline, width=width)
+
+
+def draw_ellipse(draw, x, y, w, h, fill, outline, width):
+    draw.ellipse((x, y, x + w, y + h), fill=fill, outline=outline, width=width)
+
+
+def arrow_polygon_points(auto, x, y, w, h):
     if auto == MSO_AUTO_SHAPE_TYPE.RIGHT_ARROW:
         return [
             (x, y + h * 0.25),
@@ -209,420 +269,291 @@ def arrow_polygon_points(auto, x, y, w, h) -> Optional[List[Tuple[float, float]]
             (x + w * 0.75, y + h * 0.65),
             (x + w * 0.75, y),
         ]
-    if auto == MSO_AUTO_SHAPE_TYPE.LEFT_RIGHT_ARROW:
-        return [
-            (x + w * 0.18, y + h * 0.25),
-            (x + w * 0.82, y + h * 0.25),
-            (x + w * 0.82, y),
-            (x + w, y + h * 0.5),
-            (x + w * 0.82, y + h),
-            (x + w * 0.82, y + h * 0.75),
-            (x + w * 0.18, y + h * 0.75),
-            (x + w * 0.18, y + h),
-            (x, y + h * 0.5),
-            (x + w * 0.18, y),
-        ]
     return None
 
 
-def regular_polygon_points(sides: int, x: float, y: float, w: float, h: float, rotate_deg: float = -90.0):
-    import math
-    cx = x + w / 2
-    cy = y + h / 2
-    rx = w / 2
-    ry = h / 2
-    pts = []
-    for i in range(sides):
-        ang = math.radians(rotate_deg + (360 / sides) * i)
-        pts.append((cx + rx * math.cos(ang), cy + ry * math.sin(ang)))
-    return pts
+def draw_text_box(draw, shape, scale: float, offset_x=0, offset_y=0):
+    text_frame = getattr(shape, "text_frame", None)
+    if text_frame is None:
+        return
 
+    x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
+    x = emu_to_px(x_emu, scale)
+    y = emu_to_px(y_emu, scale)
+    w = max(4, emu_to_px(w_emu, scale))
+    h = max(4, emu_to_px(h_emu, scale))
 
-def custom_polygon_points(auto, x, y, w, h) -> Optional[List[Tuple[float, float]]]:
-    if auto == MSO_AUTO_SHAPE_TYPE.ISOSCELES_TRIANGLE:
-        return [(x + w / 2, y), (x + w, y + h), (x, y + h)]
-    if auto == MSO_AUTO_SHAPE_TYPE.DIAMOND:
-        return [(x + w / 2, y), (x + w, y + h / 2), (x + w / 2, y + h), (x, y + h / 2)]
-    if auto == MSO_AUTO_SHAPE_TYPE.PENTAGON:
-        return regular_polygon_points(5, x, y, w, h)
-    if auto == MSO_AUTO_SHAPE_TYPE.HEXAGON:
-        return [
-            (x + w * 0.25, y),
-            (x + w * 0.75, y),
-            (x + w, y + h * 0.5),
-            (x + w * 0.75, y + h),
-            (x + w * 0.25, y + h),
-            (x, y + h * 0.5),
-        ]
-    if auto == MSO_AUTO_SHAPE_TYPE.CHEVRON:
-        return [
-            (x, y),
-            (x + w * 0.65, y),
-            (x + w, y + h * 0.5),
-            (x + w * 0.65, y + h),
-            (x, y + h),
-            (x + w * 0.35, y + h * 0.5),
-        ]
-    if auto == MSO_AUTO_SHAPE_TYPE.PARALLELOGRAM:
-        return [
-            (x + w * 0.2, y),
-            (x + w, y),
-            (x + w * 0.8, y + h),
-            (x, y + h),
-        ]
-    if auto == MSO_AUTO_SHAPE_TYPE.TRAPEZOID:
-        return [
-            (x + w * 0.2, y),
-            (x + w * 0.8, y),
-            (x + w, y + h),
-            (x, y + h),
-        ]
-    return None
+    paragraphs = []
+    for para in text_frame.paragraphs:
+        txt = "".join(run.text or "" for run in para.runs).strip()
+        if txt:
+            paragraphs.append((para, txt))
 
+    if not paragraphs:
+        return
 
-def hotspot_geometry_for_shape(shape, offset_x=0, offset_y=0) -> Dict[str, Any]:
-    x, y, w, h = shape_bounds(shape, offset_x, offset_y)
-    auto = get_auto_shape_type(shape)
-    shape_type = getattr(shape, "shape_type", None)
+    first_run = None
+    for para, _ in paragraphs:
+        if para.runs:
+            first_run = para.runs[0]
+            break
 
-    if shape_type == MSO_SHAPE_TYPE.LINE:
-        return {
-            "geom": "line",
-            "x1": x,
-            "y1": y,
-            "x2": x + w,
-            "y2": y + h,
-            "x": x,
-            "y": y,
-            "w": w,
-            "h": h,
-        }
+    font_size = 22
+    font_bold = False
+    font_fill = (0, 0, 0, 255)
 
-    if auto == MSO_AUTO_SHAPE_TYPE.OVAL:
-        return {"geom": "ellipse", "x": x, "y": y, "w": w, "h": h}
-
-    if auto == MSO_AUTO_SHAPE_TYPE.RECTANGLE:
-        return {"geom": "rect", "x": x, "y": y, "w": w, "h": h}
-
-    if auto == MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE:
-        return {
-            "geom": "roundrect",
-            "x": x,
-            "y": y,
-            "w": w,
-            "h": h,
-            "rx": min(w, h) * 0.12,
-            "ry": min(w, h) * 0.12,
-        }
-
-    pts = arrow_polygon_points(auto, x, y, w, h)
-    if pts:
-        return {"geom": "polygon", "x": x, "y": y, "w": w, "h": h, "points": pts}
-
-    pts = custom_polygon_points(auto, x, y, w, h)
-    if pts:
-        return {"geom": "polygon", "x": x, "y": y, "w": w, "h": h, "points": pts}
-
-    return {"geom": "rect", "x": x, "y": y, "w": w, "h": h}
-
-
-# ============================================================
-# SVG shape rendering
-# ============================================================
-
-def svg_shape_spec(shape, slide_w, slide_h, offset_x=0, offset_y=0) -> Optional[Dict[str, Any]]:
-    x, y, w, h = shape_bounds(shape, offset_x, offset_y)
-    fill = shape_fill_color(shape)
-    stroke = shape_line_color(shape)
-    stroke_width = shape_line_width_px(shape)
-    auto = get_auto_shape_type(shape)
-    shape_type = getattr(shape, "shape_type", None)
-
-    if shape_type == MSO_SHAPE_TYPE.LINE:
-        return {
-            "kind": "line",
-            "x1": x,
-            "y1": y,
-            "x2": x + w,
-            "y2": y + h,
-            "stroke": stroke,
-            "stroke_width": stroke_width,
-        }
-
-    if auto == MSO_AUTO_SHAPE_TYPE.RECTANGLE:
-        return {
-            "kind": "rect",
-            "x": x,
-            "y": y,
-            "w": w,
-            "h": h,
-            "rx": 0,
-            "ry": 0,
-            "fill": fill,
-            "stroke": stroke,
-            "stroke_width": stroke_width,
-        }
-
-    if auto == MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE:
-        return {
-            "kind": "rect",
-            "x": x,
-            "y": y,
-            "w": w,
-            "h": h,
-            "rx": min(w, h) * 0.12,
-            "ry": min(w, h) * 0.12,
-            "fill": fill,
-            "stroke": stroke,
-            "stroke_width": stroke_width,
-        }
-
-    if auto == MSO_AUTO_SHAPE_TYPE.OVAL:
-        return {
-            "kind": "ellipse",
-            "cx": x + w / 2,
-            "cy": y + h / 2,
-            "rx": w / 2,
-            "ry": h / 2,
-            "fill": fill,
-            "stroke": stroke,
-            "stroke_width": stroke_width,
-        }
-
-    pts = arrow_polygon_points(auto, x, y, w, h)
-    if pts:
-        return {
-            "kind": "polygon",
-            "points": pts,
-            "fill": fill,
-            "stroke": stroke,
-            "stroke_width": stroke_width,
-        }
-
-    pts = custom_polygon_points(auto, x, y, w, h)
-    if pts:
-        return {
-            "kind": "polygon",
-            "points": pts,
-            "fill": fill,
-            "stroke": stroke,
-            "stroke_width": stroke_width,
-        }
-
-    return None
-
-
-# ============================================================
-# Text extraction
-# ============================================================
-
-def run_to_html(run) -> str:
-    txt = html.escape(run.text or "")
-    if not txt:
-        return ""
-
-    styles = []
-    try:
-        font = run.font
-        if getattr(font, "bold", False):
-            styles.append("font-weight:700")
-        if getattr(font, "italic", False):
-            styles.append("font-style:italic")
-        if getattr(font, "underline", False):
-            styles.append("text-decoration:underline")
-        size = getattr(font, "size", None)
-        if size is not None:
-            styles.append(f"font-size:{max(10, int(size.pt))}px")
+    if first_run:
         try:
-            color = color_to_hex(font.color)
-            if color:
-                styles.append(f"color:{color}")
+            fs = getattr(first_run.font, "size", None)
+            if fs is not None:
+                font_size = max(10, int(fs.pt * scale))
         except Exception:
             pass
+        try:
+            font_bold = bool(getattr(first_run.font, "bold", False))
+        except Exception:
+            pass
+        try:
+            font_fill = color_to_rgb(first_run.font.color, default=(0, 0, 0)) + (255,)
+        except Exception:
+            pass
+
+    font = get_font(font_size, bold=font_bold)
+    line_gap = max(2, int(font_size * 0.25))
+    all_lines = []
+    line_aligns = []
+
+    for para, txt in paragraphs:
+        max_width = max(10, w - 8)
+        lines = fit_text_lines(draw, txt, font, max_width)
+        if not lines:
+            lines = [txt]
+        align = "left"
+        try:
+            if para.alignment is not None:
+                name = str(para.alignment).lower()
+                if "center" in name:
+                    align = "center"
+                elif "right" in name:
+                    align = "right"
+        except Exception:
+            pass
+        for line in lines:
+            all_lines.append(line)
+            line_aligns.append(align)
+
+    bbox = draw.textbbox((0, 0), "Ag", font=font)
+    line_h = max(1, bbox[3] - bbox[1])
+    total_h = len(all_lines) * line_h + max(0, len(all_lines) - 1) * line_gap
+
+    v_align = "top"
+    try:
+        name = str(text_frame.vertical_anchor).lower()
+        if "middle" in name:
+            v_align = "middle"
+        elif "bottom" in name:
+            v_align = "bottom"
     except Exception:
         pass
 
-    if styles:
-        txt = f'<span style="{";".join(styles)}">{txt}</span>'
+    if v_align == "middle":
+        cy = y + (h - total_h) // 2
+    elif v_align == "bottom":
+        cy = y + h - total_h - 4
+    else:
+        cy = y + 4
 
-    try:
-        url = run.hyperlink.address
-    except Exception:
-        url = None
-
-    if url:
-        txt = f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer">{txt}</a>'
-
-    return txt
-
-
-def extract_text_element(shape, offset_x=0, offset_y=0, default_center=False) -> Optional[Dict[str, Any]]:
-    text_frame = getattr(shape, "text_frame", None)
-    if text_frame is None:
-        return None
-
-    x, y, w, h = shape_bounds(shape, offset_x, offset_y)
-    paragraphs = []
-
-    for para in text_frame.paragraphs:
-        parts = [run_to_html(run) for run in para.runs]
-        parts = [p for p in parts if p]
-        if parts:
-            paragraphs.append({
-                "align": paragraph_align_to_css(para),
-                "html": "".join(parts),
-            })
-
-    if not paragraphs:
-        return None
-
-    return {
-        "type": "text",
-        "x": x,
-        "y": y,
-        "w": w,
-        "h": h,
-        "paragraphs": paragraphs,
-        "v_align": vertical_anchor_to_css(text_frame, default_center=default_center),
-    }
+    for line, align in zip(all_lines, line_aligns):
+        tw = draw.textlength(line, font=font)
+        if align == "center":
+            tx = x + (w - tw) / 2
+        elif align == "right":
+            tx = x + w - tw - 4
+        else:
+            tx = x + 4
+        draw.text((tx, cy), line, font=font, fill=font_fill)
+        cy += line_h + line_gap
 
 
-# ============================================================
-# Table extraction
-# ============================================================
-
-def extract_table_element(shape, offset_x=0, offset_y=0) -> Optional[Dict[str, Any]]:
+def draw_table(draw, shape, scale: float, offset_x=0, offset_y=0):
     try:
         table = shape.table
     except Exception:
-        return None
+        return
 
-    x, y, w, h = shape_bounds(shape, offset_x, offset_y)
+    x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
+    x = emu_to_px(x_emu, scale)
+    y = emu_to_px(y_emu, scale)
+    w = max(4, emu_to_px(w_emu, scale))
+    h = max(4, emu_to_px(h_emu, scale))
 
     try:
-        col_widths = [int(col.width) for col in table.columns]
+        col_widths = [emu_to_px(col.width, scale) for col in table.columns]
     except Exception:
-        col_widths = []
+        col_count = len(table.columns)
+        col_widths = [w // max(1, col_count)] * max(1, col_count)
 
-    rows = []
-    for row in table.rows:
-        cells = []
-        for cell in row.cells:
-            cell_html_parts = []
-            for para in cell.text_frame.paragraphs:
-                parts = [run_to_html(run) for run in para.runs]
-                parts = [p for p in parts if p]
-                if parts:
-                    cell_html_parts.append(
-                        f'<div style="text-align:{paragraph_align_to_css(para)};">{"".join(parts)}</div>'
-                    )
+    try:
+        row_heights = [emu_to_px(row.height, scale) for row in table.rows]
+    except Exception:
+        row_count = len(table.rows)
+        row_heights = [h // max(1, row_count)] * max(1, row_count)
 
-            fill = "transparent"
-            border = "#555"
-
+    cy = y
+    for r_idx, row in enumerate(table.rows):
+        rh = row_heights[r_idx] if r_idx < len(row_heights) else max(20, h // max(1, len(table.rows)))
+        cx = x
+        for c_idx, cell in enumerate(row.cells):
+            cw = col_widths[c_idx] if c_idx < len(col_widths) else max(30, w // max(1, len(table.columns)))
+            fill = (255, 255, 255, 0)
             try:
-                fc = color_to_hex(cell.fill.fore_color)
-                if fc:
-                    fill = fc
+                fill = color_to_rgb(cell.fill.fore_color, default=(255, 255, 255)) + (255,)
             except Exception:
                 pass
 
-            cells.append({
-                "html": "".join(cell_html_parts) if cell_html_parts else "&nbsp;",
-                "fill": fill,
-                "border": border,
-            })
-        rows.append(cells)
+            draw.rectangle((cx, cy, cx + cw, cy + rh), fill=fill, outline=(85, 85, 85, 255), width=1)
 
-    return {
-        "type": "table",
-        "x": x,
-        "y": y,
-        "w": w,
-        "h": h,
-        "col_widths": col_widths,
-        "rows": rows,
-    }
+            text = cell.text.strip()
+            if text:
+                font = get_font(max(11, int(16 * scale)))
+                lines = fit_text_lines(draw, text, font, max(10, cw - 8))
+                bbox = draw.textbbox((0, 0), "Ag", font=font)
+                lh = max(1, bbox[3] - bbox[1])
+                total_h = len(lines) * lh
+                ty = cy + max(2, (rh - total_h) // 2)
+                for line in lines:
+                    tw = draw.textlength(line, font=font)
+                    tx = cx + max(4, (cw - tw) / 2)
+                    draw.text((tx, ty), line, font=font, fill=(0, 0, 0, 255))
+                    ty += lh
+            cx += cw
+        cy += rh
 
 
-# ============================================================
-# Image extraction
-# ============================================================
+def draw_shape_object(draw, shape, scale: float, offset_x=0, offset_y=0):
+    x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
+    x = emu_to_px(x_emu, scale)
+    y = emu_to_px(y_emu, scale)
+    w = max(1, emu_to_px(w_emu, scale))
+    h = max(1, emu_to_px(h_emu, scale))
 
-def extract_image_element(shape, media: Dict[str, bytes], slide_index: int, image_index: int, offset_x=0, offset_y=0):
+    fill = shape_fill_rgb(shape)
+    outline = shape_line_rgb(shape)
+    width = shape_line_width_px(shape, scale)
+    auto = get_auto_shape_type(shape)
+    shape_type = getattr(shape, "shape_type", None)
+
+    if shape_type == MSO_SHAPE_TYPE.LINE:
+        draw_line(draw, x, y, x + w, y + h, outline, width)
+        return
+
+    if auto == MSO_AUTO_SHAPE_TYPE.RECTANGLE:
+        draw_rect(draw, x, y, w, h, fill, outline, width, radius=0)
+        return
+
+    if auto == MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE:
+        draw_rect(draw, x, y, w, h, fill, outline, width, radius=max(4, min(w, h) // 8))
+        return
+
+    if auto == MSO_AUTO_SHAPE_TYPE.OVAL:
+        draw_ellipse(draw, x, y, w, h, fill, outline, width)
+        return
+
+    pts = arrow_polygon_points(auto, x, y, w, h)
+    if pts:
+        draw.polygon(pts, fill=fill, outline=outline)
+        return
+
+    # fallback for unsupported shapes
+    if auto is not None:
+        draw_rect(draw, x, y, w, h, fill, outline, width, radius=0)
+
+
+def paste_picture(canvas: Image.Image, shape, scale: float, offset_x=0, offset_y=0):
     try:
-        image = getattr(shape, "image", None)
+        image = shape.image
         if image is None:
-            return None
-        ext = image.ext or "png"
-        filename = f"media/slide_{slide_index:03d}_img_{image_index:02d}.{ext}"
-        media[filename] = image.blob
-        x, y, w, h = shape_bounds(shape, offset_x, offset_y)
-        return {
-            "type": "image",
-            "x": x,
-            "y": y,
-            "w": w,
-            "h": h,
-            "src": filename,
-        }
+            return
+        x_emu, y_emu, w_emu, h_emu = shape_bounds(shape, offset_x, offset_y)
+        x = emu_to_px(x_emu, scale)
+        y = emu_to_px(y_emu, scale)
+        w = max(1, emu_to_px(w_emu, scale))
+        h = max(1, emu_to_px(h_emu, scale))
+
+        img = Image.open(io.BytesIO(image.blob)).convert("RGBA")
+        img = img.resize((w, h))
+        canvas.alpha_composite(img, (x, y))
     except Exception:
-        return None
+        pass
 
 
-# ============================================================
-# Recursive slide extraction
-# ============================================================
-
-def process_shape(
-    shape,
-    prs: Presentation,
-    slide_idx_zero: int,
-    slide_out: Dict[str, Any],
-    media: Dict[str, bytes],
-    slide_index_one: int,
-    counters: Dict[str, int],
-    offset_x: int = 0,
-    offset_y: int = 0,
-):
+def render_shape_recursive(canvas: Image.Image, draw: ImageDraw.ImageDraw, shape, scale: float, offset_x=0, offset_y=0):
     shape_type = getattr(shape, "shape_type", None)
 
     if shape_type == MSO_SHAPE_TYPE.GROUP:
         gx, gy, _, _ = shape_bounds(shape, offset_x, offset_y)
         try:
             for child in shape.shapes:
-                process_shape(
-                    child,
-                    prs,
-                    slide_idx_zero,
-                    slide_out,
-                    media,
-                    slide_index_one,
-                    counters,
-                    offset_x=gx,
-                    offset_y=gy,
-                )
+                render_shape_recursive(canvas, draw, child, scale, gx, gy)
         except Exception:
             pass
         return
 
-    img_el = extract_image_element(shape, media, slide_index_one, counters["images"] + 1, offset_x, offset_y)
-    if img_el is not None:
-        counters["images"] += 1
-        slide_out["images"].append(img_el)
+    try:
+        if getattr(shape, "image", None) is not None:
+            paste_picture(canvas, shape, scale, offset_x, offset_y)
+    except Exception:
+        pass
 
-    table_el = extract_table_element(shape, offset_x, offset_y)
-    if table_el is not None:
-        slide_out["tables"].append(table_el)
+    try:
+        draw_table(draw, shape, scale, offset_x, offset_y)
+    except Exception:
+        pass
 
-    svg = svg_shape_spec(shape, int(prs.slide_width), int(prs.slide_height), offset_x, offset_y)
-    if svg is not None:
-        slide_out["svg_shapes"].append(svg)
+    try:
+        draw_shape_object(draw, shape, scale, offset_x, offset_y)
+    except Exception:
+        pass
 
-    default_center = get_auto_shape_type(shape) is not None
-    text_el = extract_text_element(shape, offset_x, offset_y, default_center=default_center)
-    if text_el is not None:
-        slide_out["text_elements"].append(text_el)
+    try:
+        if getattr(shape, "has_text_frame", False):
+            draw_text_box(draw, shape, scale, offset_x, offset_y)
+    except Exception:
+        pass
+
+
+def render_slide_to_png(slide, prs: Presentation) -> bytes:
+    slide_w = int(prs.slide_width)
+    slide_h = int(prs.slide_height)
+    scale = CANVAS_W / slide_w
+    canvas_h = max(1, int(round(slide_h * scale)))
+
+    canvas = Image.new("RGBA", (CANVAS_W, canvas_h), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    for shape in slide.shapes:
+        render_shape_recursive(canvas, draw, shape, scale)
+
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
+
+
+# ============================================================
+# Extract slide package data
+# ============================================================
+
+def collect_hotspots_recursive(shape, prs, slide_idx_zero: int, hotspots: List[Dict[str, Any]], offset_x=0, offset_y=0):
+    shape_type = getattr(shape, "shape_type", None)
+
+    if shape_type == MSO_SHAPE_TYPE.GROUP:
+        gx, gy, _, _ = shape_bounds(shape, offset_x, offset_y)
+        try:
+            for child in shape.shapes:
+                collect_hotspots_recursive(child, prs, slide_idx_zero, hotspots, gx, gy)
+        except Exception:
+            pass
+        return
 
     try:
         external = extract_shape_external_link(shape)
@@ -633,7 +564,7 @@ def process_shape(
                 geom = {**geom, "kind": "external", "url": external}
             else:
                 geom = {**geom, "kind": "internal", "target_slide": internal}
-            slide_out["hotspots"].append(geom)
+            hotspots.append(geom)
     except Exception:
         pass
 
@@ -643,30 +574,18 @@ def extract_course(prs: Presentation) -> Tuple[Dict[str, Any], Dict[str, bytes]]
     slides_out = []
 
     for s_idx, slide in enumerate(prs.slides, start=1):
-        slide_out = {
-            "index": s_idx,
-            "svg_shapes": [],
-            "images": [],
-            "tables": [],
-            "text_elements": [],
-            "hotspots": [],
-        }
-        counters = {"images": 0}
+        slide_img_name = f"slides/slide_{s_idx:03d}.png"
+        media[slide_img_name] = render_slide_to_png(slide, prs)
 
+        hotspots: List[Dict[str, Any]] = []
         for shape in slide.shapes:
-            process_shape(
-                shape=shape,
-                prs=prs,
-                slide_idx_zero=s_idx - 1,
-                slide_out=slide_out,
-                media=media,
-                slide_index_one=s_idx,
-                counters=counters,
-                offset_x=0,
-                offset_y=0,
-            )
+            collect_hotspots_recursive(shape, prs, s_idx - 1, hotspots, 0, 0)
 
-        slides_out.append(slide_out)
+        slides_out.append({
+            "index": s_idx,
+            "image": slide_img_name,
+            "hotspots": hotspots,
+        })
 
     course = {
         "slideWidthEmu": int(prs.slide_width),
@@ -677,7 +596,7 @@ def extract_course(prs: Presentation) -> Tuple[Dict[str, Any], Dict[str, bytes]]
 
 
 # ============================================================
-# SCORM
+# SCORM / HTML player
 # ============================================================
 
 def build_scorm_driver_js() -> str:
@@ -764,10 +683,6 @@ def build_manifest_xml(course_id: str, title: str, media_files: List[str]) -> st
 </manifest>"""
 
 
-# ============================================================
-# HTML player
-# ============================================================
-
 def build_player_html(title: str, course: Dict[str, Any]) -> str:
     data = json.dumps(course, ensure_ascii=False)
 
@@ -781,7 +696,6 @@ def build_player_html(title: str, course: Dict[str, Any]) -> str:
 * {{
   box-sizing: border-box;
 }}
-
 body {{
   margin: 0;
   font-family: Arial, sans-serif;
@@ -789,26 +703,22 @@ body {{
   color: #f1f1f1;
   min-height: 100vh;
 }}
-
 .app {{
   display: flex;
   min-height: 100vh;
 }}
-
 .sidebar {{
   width: 130px;
   background: #1a1a1a;
   border-right: 1px solid #333;
   padding: 16px 10px;
 }}
-
 .sidebar label {{
   display: block;
   font-size: 13px;
   color: #bbb;
   margin-bottom: 8px;
 }}
-
 .sidebar select {{
   width: 100%;
   height: calc(100vh - 40px);
@@ -819,36 +729,30 @@ body {{
   border-radius: 8px;
   padding: 8px;
 }}
-
 .main {{
   flex: 1;
   display: flex;
   flex-direction: column;
 }}
-
 .header {{
   background: #1a1a1a;
   border-bottom: 1px solid #333;
   padding: 12px 16px;
 }}
-
 .header-title {{
   font-weight: 700;
 }}
-
 .header-sub {{
   color: #bbb;
   font-size: 14px;
   margin-top: 4px;
 }}
-
 .stage-wrap {{
   flex: 1;
   display: grid;
   place-items: center;
   padding: 18px;
 }}
-
 .frame {{
   width: min(100%, 1280px);
   aspect-ratio: 16 / 9;
@@ -858,77 +762,21 @@ body {{
   border-radius: 10px;
   box-shadow: 0 14px 40px rgba(0,0,0,.45);
 }}
-
-.svg-layer,
-.image-layer,
-.table-layer,
-.text-layer,
-.hotspot-layer {{
+.slide-image {{
   position: absolute;
   inset: 0;
-}}
-
-.svg-layer svg {{
   width: 100%;
   height: 100%;
-  display: block;
-}}
-
-.el-img {{
-  position: absolute;
   object-fit: contain;
 }}
-
-.el-text {{
-  position: absolute;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  color: #111;
-  line-height: 1.2;
-  pointer-events: auto;
-  padding: 2px 4px;
-  white-space: normal;
-  word-break: break-word;
-}}
-
-.el-text a {{
-  color: #0a58ca;
-  text-decoration: underline;
-}}
-
-.el-table {{
-  position: absolute;
-  border-collapse: collapse;
-  table-layout: fixed;
-  background: transparent;
-  color: #111;
-  font-size: 14px;
-}}
-
-.el-table td {{
-  border: 1px solid #555;
-  padding: 4px 6px;
-  vertical-align: middle;
-  overflow: hidden;
-}}
-
 .hotspot-layer {{
-  pointer-events: none;
-}}
-
-.hotspot-shape {{
   position: absolute;
   inset: 0;
+}}
+.hotspot-svg {{
   width: 100%;
   height: 100%;
-  pointer-events: auto;
 }}
-
-.hotspot-shape a {{
-  cursor: pointer;
-}}
-
 .bottom-bar {{
   background: #1a1a1a;
   border-top: 1px solid #333;
@@ -937,7 +785,6 @@ body {{
   justify-content: center;
   gap: 12px;
 }}
-
 .bottom-bar button {{
   background: #262626;
   color: #f1f1f1;
@@ -947,7 +794,6 @@ body {{
   cursor: pointer;
   min-width: 100px;
 }}
-
 .footer {{
   text-align: center;
   background: #1a1a1a;
@@ -972,10 +818,7 @@ body {{
 
     <div class="stage-wrap">
       <div class="frame">
-        <div class="svg-layer" id="svgLayer"></div>
-        <div class="image-layer" id="imageLayer"></div>
-        <div class="table-layer" id="tableLayer"></div>
-        <div class="text-layer" id="textLayer"></div>
+        <img id="slideImage" class="slide-image" alt="Slide" />
         <div class="hotspot-layer" id="hotspotLayer"></div>
       </div>
     </div>
@@ -985,7 +828,7 @@ body {{
       <button onclick="nextSlide()">Next</button>
     </div>
 
-    <div class="footer">Pure-Python SVG/HTML renderer with shape-aware hotspots.</div>
+    <div class="footer">Static slide image with clickable hotspots.</div>
   </div>
 </div>
 
@@ -994,10 +837,7 @@ body {{
 const course = {data};
 let currentSlide = 1;
 
-const svgLayer = document.getElementById("svgLayer");
-const imageLayer = document.getElementById("imageLayer");
-const tableLayer = document.getElementById("tableLayer");
-const textLayer = document.getElementById("textLayer");
+const slideImage = document.getElementById("slideImage");
 const hotspotLayer = document.getElementById("hotspotLayer");
 const counter = document.getElementById("counter");
 const jumpSelect = document.getElementById("jumpSelect");
@@ -1013,95 +853,6 @@ function populateJumpMenu() {{
     opt.value = slide.index;
     opt.textContent = `Slide ${{slide.index}}`;
     jumpSelect.appendChild(opt);
-  }}
-}}
-
-function renderSVG(slide) {{
-  let shapes = "";
-  for (const raw of slide.svg_shapes || []) {{
-    if (raw.kind === "rect") {{
-      shapes += `<rect x="${{pct(raw.x, course.slideWidthEmu)}}%" y="${{pct(raw.y, course.slideHeightEmu)}}%" width="${{pct(raw.w, course.slideWidthEmu)}}%" height="${{pct(raw.h, course.slideHeightEmu)}}%" rx="${{pct(raw.rx || 0, course.slideWidthEmu)}}%" ry="${{pct(raw.ry || 0, course.slideHeightEmu)}}%" fill="${{raw.fill}}" stroke="${{raw.stroke}}" stroke-width="${{raw.stroke_width}}" />`;
-    }} else if (raw.kind === "ellipse") {{
-      shapes += `<ellipse cx="${{pct(raw.cx, course.slideWidthEmu)}}%" cy="${{pct(raw.cy, course.slideHeightEmu)}}%" rx="${{pct(raw.rx, course.slideWidthEmu)}}%" ry="${{pct(raw.ry, course.slideHeightEmu)}}%" fill="${{raw.fill}}" stroke="${{raw.stroke}}" stroke-width="${{raw.stroke_width}}" />`;
-    }} else if (raw.kind === "line") {{
-      shapes += `<line x1="${{pct(raw.x1, course.slideWidthEmu)}}%" y1="${{pct(raw.y1, course.slideHeightEmu)}}%" x2="${{pct(raw.x2, course.slideWidthEmu)}}%" y2="${{pct(raw.y2, course.slideHeightEmu)}}%" stroke="${{raw.stroke}}" stroke-width="${{raw.stroke_width}}" />`;
-    }} else if (raw.kind === "polygon") {{
-      const pts = (raw.points || []).map(p => `${{pct(p[0], course.slideWidthEmu)}},${{pct(p[1], course.slideHeightEmu)}}`).join(" ");
-      shapes += `<polygon points="${{pts}}" fill="${{raw.fill}}" stroke="${{raw.stroke}}" stroke-width="${{raw.stroke_width}}" />`;
-    }}
-  }}
-
-  svgLayer.innerHTML = `<svg viewBox="0 0 100 100" preserveAspectRatio="none">${{shapes}}</svg>`;
-}}
-
-function renderImages(slide) {{
-  imageLayer.innerHTML = "";
-  for (const el of slide.images || []) {{
-    const img = document.createElement("img");
-    img.className = "el-img";
-    img.src = el.src;
-    img.style.left = pct(el.x, course.slideWidthEmu) + "%";
-    img.style.top = pct(el.y, course.slideHeightEmu) + "%";
-    img.style.width = pct(el.w, course.slideWidthEmu) + "%";
-    img.style.height = pct(el.h, course.slideHeightEmu) + "%";
-    imageLayer.appendChild(img);
-  }}
-}}
-
-function renderTables(slide) {{
-  tableLayer.innerHTML = "";
-  for (const t of slide.tables || []) {{
-    const table = document.createElement("table");
-    table.className = "el-table";
-    table.style.left = pct(t.x, course.slideWidthEmu) + "%";
-    table.style.top = pct(t.y, course.slideHeightEmu) + "%";
-    table.style.width = pct(t.w, course.slideWidthEmu) + "%";
-    table.style.height = pct(t.h, course.slideHeightEmu) + "%";
-
-    if (t.col_widths && t.col_widths.length) {{
-      const cg = document.createElement("colgroup");
-      const total = t.col_widths.reduce((a,b)=>a+b,0);
-      for (const cw of t.col_widths) {{
-        const col = document.createElement("col");
-        col.style.width = pct(cw, total) + "%";
-        cg.appendChild(col);
-      }}
-      table.appendChild(cg);
-    }}
-
-    for (const row of t.rows || []) {{
-      const tr = document.createElement("tr");
-      for (const cell of row) {{
-        const td = document.createElement("td");
-        td.innerHTML = cell.html || "&nbsp;";
-        td.style.background = cell.fill || "transparent";
-        td.style.borderColor = cell.border || "#555";
-        tr.appendChild(td);
-      }}
-      table.appendChild(tr);
-    }}
-
-    tableLayer.appendChild(table);
-  }}
-}}
-
-function renderText(slide) {{
-  textLayer.innerHTML = "";
-  for (const el of slide.text_elements || []) {{
-    const div = document.createElement("div");
-    div.className = "el-text";
-    div.style.left = pct(el.x, course.slideWidthEmu) + "%";
-    div.style.top = pct(el.y, course.slideHeightEmu) + "%";
-    div.style.width = pct(el.w, course.slideWidthEmu) + "%";
-    div.style.height = pct(el.h, course.slideHeightEmu) + "%";
-    div.style.justifyContent = el.v_align || "flex-start";
-
-    let inner = "";
-    for (const p of el.paragraphs || []) {{
-      inner += `<div style="text-align:${{p.align || "left"}};">${{p.html}}</div>`;
-    }}
-    div.innerHTML = inner;
-    textLayer.appendChild(div);
   }}
 }}
 
@@ -1124,12 +875,12 @@ function renderHotspots(slide) {{
   hotspotLayer.innerHTML = "";
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("class", "hotspot-shape");
+  svg.setAttribute("class", "hotspot-svg");
   svg.setAttribute("viewBox", "0 0 100 100");
   svg.setAttribute("preserveAspectRatio", "none");
 
   for (const link of slide.hotspots || []) {{
-    let anchor = document.createElementNS("http://www.w3.org/2000/svg", "a");
+    const anchor = document.createElementNS("http://www.w3.org/2000/svg", "a");
     addHotspotAnchor(anchor, link);
 
     let shapeEl = null;
@@ -1140,42 +891,27 @@ function renderHotspots(slide) {{
       shapeEl.setAttribute("cy", pct(link.y + link.h / 2, course.slideHeightEmu));
       shapeEl.setAttribute("rx", pct(link.w / 2, course.slideWidthEmu));
       shapeEl.setAttribute("ry", pct(link.h / 2, course.slideHeightEmu));
-    }} else if (link.geom === "roundrect" || link.geom === "rect") {{
-      shapeEl = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      shapeEl.setAttribute("x", pct(link.x, course.slideWidthEmu));
-      shapeEl.setAttribute("y", pct(link.y, course.slideHeightEmu));
-      shapeEl.setAttribute("width", pct(link.w, course.slideWidthEmu));
-      shapeEl.setAttribute("height", pct(link.h, course.slideHeightEmu));
-      if (link.geom === "roundrect") {{
-        shapeEl.setAttribute("rx", pct(link.rx || 0, course.slideWidthEmu));
-        shapeEl.setAttribute("ry", pct(link.ry || 0, course.slideHeightEmu));
-      }}
-    }} else if (link.geom === "polygon" && link.points) {{
-      shapeEl = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
-      const pts = link.points.map(p => `${{pct(p[0], course.slideWidthEmu)}},${{pct(p[1], course.slideHeightEmu)}}`).join(" ");
-      shapeEl.setAttribute("points", pts);
+      shapeEl.setAttribute("fill", "rgba(0,0,0,0)");
+      shapeEl.setAttribute("stroke", "rgba(0,0,0,0)");
     }} else if (link.geom === "line") {{
       shapeEl = document.createElementNS("http://www.w3.org/2000/svg", "line");
       shapeEl.setAttribute("x1", pct(link.x1, course.slideWidthEmu));
       shapeEl.setAttribute("y1", pct(link.y1, course.slideHeightEmu));
       shapeEl.setAttribute("x2", pct(link.x2, course.slideWidthEmu));
       shapeEl.setAttribute("y2", pct(link.y2, course.slideHeightEmu));
-      shapeEl.setAttribute("stroke-width", "12");
       shapeEl.setAttribute("stroke", "rgba(0,0,0,0)");
+      shapeEl.setAttribute("stroke-width", "12");
       shapeEl.setAttribute("pointer-events", "stroke");
-      anchor.appendChild(shapeEl);
-      svg.appendChild(anchor);
-      continue;
     }} else {{
       shapeEl = document.createElementNS("http://www.w3.org/2000/svg", "rect");
       shapeEl.setAttribute("x", pct(link.x, course.slideWidthEmu));
       shapeEl.setAttribute("y", pct(link.y, course.slideHeightEmu));
       shapeEl.setAttribute("width", pct(link.w, course.slideWidthEmu));
       shapeEl.setAttribute("height", pct(link.h, course.slideHeightEmu));
+      shapeEl.setAttribute("fill", "rgba(0,0,0,0)");
+      shapeEl.setAttribute("stroke", "rgba(0,0,0,0)");
     }}
 
-    shapeEl.setAttribute("fill", "rgba(0,0,0,0)");
-    shapeEl.setAttribute("stroke", "rgba(0,0,0,0)");
     anchor.appendChild(shapeEl);
     svg.appendChild(anchor);
   }}
@@ -1198,11 +934,7 @@ function goToSlide(num) {{
   if (num < 1 || num > course.slides.length) return;
   currentSlide = num;
   const slide = course.slides[currentSlide - 1];
-
-  renderSVG(slide);
-  renderImages(slide);
-  renderTables(slide);
-  renderText(slide);
+  slideImage.src = slide.image;
   renderHotspots(slide);
 
   counter.textContent = `Slide ${{currentSlide}} of ${{course.slides.length}}`;
@@ -1252,7 +984,7 @@ window.addEventListener("beforeunload", function() {{
 
 
 # ============================================================
-# Build ZIP
+# ZIP build
 # ============================================================
 
 def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str):
@@ -1279,7 +1011,7 @@ def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str):
     out_name = f"{safe_name(Path(pptx_name).stem)}_scorm12.zip"
     summary = {
         "slides": len(prs.slides),
-        "media": len(media),
+        "assets": len(media),
     }
     return mem.read(), out_name, summary
 
@@ -1290,26 +1022,26 @@ def build_scorm_zip(pptx_bytes: bytes, pptx_name: str, course_title: str):
 
 st.set_page_config(page_title=APP_TITLE, layout="centered")
 st.title(APP_TITLE)
-st.caption("Pure-Python MVP: PPTX → HTML/SVG slide player → SCORM 1.2 ZIP")
+st.caption("Pure-Python MVP: PPTX → static slide images + hotspots → SCORM 1.2 ZIP")
 
 with st.expander("What this version supports"):
     st.markdown(
         """
-- Basic geometric shape rendering with SVG
-- Rectangles, rounded rectangles, ellipses, arrows, several polygon-like shapes
-- Text boxes and text inside shapes
+- Static slide image rendering in Python
+- Text rendered into the slide image
+- Basic shapes: circles/ovals, rectangles, rounded rectangles, lines, simple arrows
 - Basic tables
-- Embedded pictures
+- Embedded images
 - External hyperlinks
 - Internal slide-jump hotspots
-- Shape-aware hotspots for supported shapes
+- Shape-aware hotspots for circles/ovals
+- Rectangular fallback for unsupported shapes/polygons
 - Left slide menu and bottom centered navigation
 
 Still limited:
 - Not full PowerPoint fidelity
-- No animations, gradients, shadows, or advanced effects
-- Complex grouped layouts may still need refinement
-- Unsupported shape types fall back to simpler handling
+- Unsupported complex shapes may render as simple fallbacks
+- Rotation and some advanced formatting are not fully handled
         """
     )
 
@@ -1328,7 +1060,7 @@ if st.button("Publish SCORM", type="primary", use_container_width=True):
             )
             st.success("SCORM package created.")
             st.write(f"Slides detected: {summary['slides']}")
-            st.write(f"Embedded pictures copied: {summary['media']}")
+            st.write(f"Generated assets: {summary['assets']}")
             st.download_button(
                 "Download SCORM ZIP",
                 data=zip_bytes,
