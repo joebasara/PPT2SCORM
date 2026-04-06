@@ -1,30 +1,33 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PPT2SCORM Tools</title>
 
   <!-- Google Analytics -->
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-63S810VT70"></script>
   <script>
     window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
+    function gtag() {
+      dataLayer.push(arguments);
+    }
     gtag('js', new Date());
     gtag('config', 'G-63S810VT70');
   </script>
 
-  <!-- Simple styling -->
   <style>
     body {
       font-family: Arial, sans-serif;
       background-color: #f2f2f2;
       text-align: center;
       padding: 50px;
+      margin: 0;
     }
 
     h1 {
       color: #333;
+      margin-bottom: 16px;
     }
 
     p {
@@ -39,11 +42,11 @@
       margin: 10px;
       font-size: 18px;
       font-weight: bold;
-      color: white;
+      color: #fff;
       background-color: #007bff;
       text-decoration: none;
       border-radius: 8px;
-      transition: background-color 0.3s;
+      transition: background-color 0.3s ease;
     }
 
     .download-btn:hover {
@@ -55,39 +58,48 @@
   <h1>PPT2SCORM Tools</h1>
   <p>Download the tools to manage and publish your PowerPoint to SCORM packages quickly and easily.</p>
 
-  <!-- Download PPT2SCORM Publisher -->
-<a 
-  class="download-btn" 
-  href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Publisher.exe"
-  onclick="event.preventDefault();
-  const url = this.href;
-  gtag('event', 'download_click', {
-    event_label: 'PPT2SCORM_Publisher.exe',
-    transport_type: 'beacon'
-  });
-  setTimeout(() => {
-    window.location.href = url;
-  }, 500);
-">
-  Download PPT2SCORM Publisher
-</a>
+  <a
+    class="download-btn"
+    href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Publisher.exe"
+    data-label="PPT2SCORM_Publisher.exe"
+  >
+    Download PPT2SCORM Publisher
+  </a>
 
-<!-- Download PPT Layer Manager -->
-<a 
-  class="download-btn" 
-  href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPTLayerManager.exe"
-  onclick="event.preventDefault();
-  const url = this.href;
-  gtag('event', 'download_click', {
-    event_label: 'PPTLayerManager.exe',
-    transport_type: 'beacon'
-  });
-  setTimeout(() => {
-    window.location.href = url;
-  }, 500);
-">
-  Download PPT Layer Manager
-</a>
+  <a
+    class="download-btn"
+    href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPTLayerManager.exe"
+    data-label="PPTLayerManager.exe"
+  >
+    Download PPT Layer Manager
+  </a>
 
+  <script>
+    document.querySelectorAll('.download-btn').forEach(function (button) {
+      button.addEventListener('click', function (event) {
+        event.preventDefault();
+
+        var url = button.getAttribute('href');
+        var label = button.getAttribute('data-label');
+        var redirected = false;
+
+        function goToDownload() {
+          if (!redirected) {
+            redirected = true;
+            window.location.href = url;
+          }
+        }
+
+        gtag('event', 'download_click', {
+          event_category: 'engagement',
+          event_label: label,
+          transport_type: 'beacon',
+          event_callback: goToDownload
+        });
+
+        setTimeout(goToDownload, 700);
+      });
+    });
+  </script>
 </body>
 </html>
