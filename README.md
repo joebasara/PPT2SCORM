@@ -1,4 +1,4 @@
-# PPTX to SCORM Converter
+# Convert Powerpoint files to SCORM + html
 
 This desktop app converts PowerPoint (.pptx) files into SCORM 1.2 packages to upload in LMS platforms such as Blackboard.
 
