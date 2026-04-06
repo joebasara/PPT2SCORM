@@ -42,7 +42,7 @@
       margin: 10px;
       font-size: 18px;
       font-weight: bold;
-      color: #fff;
+      color: #ffffff;
       background-color: #007bff;
       text-decoration: none;
       border-radius: 8px;
@@ -61,7 +61,7 @@
   <a
     class="download-btn"
     href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Publisher.exe"
-    data-label="PPT2SCORM_Publisher.exe"
+    onclick="trackDownload(event, 'PPT2SCORM_Publisher.exe', this.href)"
   >
     Download PPT2SCORM Publisher
   </a>
@@ -69,37 +69,29 @@
   <a
     class="download-btn"
     href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPTLayerManager.exe"
-    data-label="PPTLayerManager.exe"
+    onclick="trackDownload(event, 'PPTLayerManager.exe', this.href)"
   >
     Download PPT Layer Manager
   </a>
 
   <script>
-    document.querySelectorAll('.download-btn').forEach(function (button) {
-      button.addEventListener('click', function (event) {
-        event.preventDefault();
+    function trackDownload(event, fileName, url) {
+      event.preventDefault();
 
-        var url = button.getAttribute('href');
-        var label = button.getAttribute('data-label');
-        var redirected = false;
-
-        function goToDownload() {
-          if (!redirected) {
-            redirected = true;
-            window.location.href = url;
-          }
-        }
-
-        gtag('event', 'download_click', {
-          event_category: 'engagement',
-          event_label: label,
-          transport_type: 'beacon',
-          event_callback: goToDownload
+      try {
+        gtag('event', 'file_download', {
+          file_name: fileName,
+          link_url: url,
+          transport_type: 'beacon'
         });
+      } catch (error) {
+        console.error('Google Analytics event error:', error);
+      }
 
-        setTimeout(goToDownload, 700);
-      });
-    });
+      setTimeout(function () {
+        window.location.href = url;
+      }, 1000);
+    }
   </script>
 </body>
 </html>
