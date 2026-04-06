@@ -4,11 +4,9 @@ This desktop app converts PowerPoint (.pptx) files into SCORM 1.2 packages to up
 
 ## Run locally
 
-Run the app:
-PPT2SCORM_Publisher.exe
+Run the app: PPT2SCORM_Publisher.exe
 
-Install the custom PPT tab to create interactions:
-PPTLayerManager.exe
+Install the custom PPT tab to create interactions: PPTLayerManager.exe
 
 ## Limitations
 
