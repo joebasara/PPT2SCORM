@@ -1,15 +1,73 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>My Software</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PPT2SCORM Tools</title>
+
+  <!-- Google Analytics -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-63S810VT70"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-63S810VT70');
+  </script>
+
+  <!-- Simple styling -->
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f2f2f2;
+      text-align: center;
+      padding: 50px;
+    }
+
+    h1 {
+      color: #333;
+    }
+
+    p {
+      font-size: 18px;
+      color: #555;
+      margin-bottom: 40px;
+    }
+
+    .download-btn {
+      display: inline-block;
+      padding: 15px 30px;
+      margin: 10px;
+      font-size: 18px;
+      font-weight: bold;
+      color: white;
+      background-color: #007bff;
+      text-decoration: none;
+      border-radius: 8px;
+      transition: background-color 0.3s;
+    }
+
+    .download-btn:hover {
+      background-color: #0056b3;
+    }
+  </style>
 </head>
 <body>
-  <h1>My App</h1>
-  <p>Fast AI background remover</p>
+  <h1>PPT2SCORM Tools</h1>
+  <p>Download the tools to manage and publish your PowerPoint to SCORM packages quickly and easily.</p>
 
-  <a href="https://github.com/YOUR_REPO/releases/latest/download/yourfile.exe"
-     onclick="trackDownload()">
-     Download Now
+  <!-- Download Buttons -->
+  <a 
+     class="download-btn" 
+     href="https://github.com/joebasara/PPT2SCORM/releases/latest/download/PPT2SCORM_Publisher.exe" 
+     onclick="gtag('event', 'download_click', {event_category:'engagement', event_label:'PPT2SCORM_Publisher.exe'});">
+     Download PPT2SCORM Publisher
+  </a>
+
+  <a 
+     class="download-btn" 
+     href="https://github.com/joebasara/PPT2SCORM/releases/latest/download/PPTLayerManager.exe" 
+     onclick="gtag('event', 'download_click', {event_category:'engagement', event_label:'PPTLayerManager.exe'});">
+     Download PPT Layer Manager
   </a>
 
 </body>
