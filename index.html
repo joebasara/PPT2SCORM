@@ -80,6 +80,7 @@
 
     .file-info {
       flex: 1;
+      min-width: 0;
     }
 
     .file-name {
@@ -87,6 +88,7 @@
       font-size: 22px;
       font-weight: bold;
       color: var(--purple);
+      word-break: break-word;
     }
 
     .file-size {
@@ -107,6 +109,8 @@
       border: 1px solid var(--purple);
       border-radius: 10px;
       transition: 0.25s;
+      flex-shrink: 0;
+      text-align: center;
     }
 
     .download-btn:hover {
@@ -134,6 +138,10 @@
       .download-btn {
         width: 100%;
       }
+
+      .file-name {
+        font-size: 18px;
+      }
     }
   </style>
 </head>
@@ -144,63 +152,66 @@
 
     <div class="downloads-list">
 
-      <!-- Row 1 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">PPT2SCORM_Publisher</p>
-          <p class="file-size">EXE • 12.4 MB</p>
+          <p class="file-size">EXE • 38.2 MB</p>
         </div>
-        <a class="download-btn"
+        <a
+          class="download-btn"
           href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Publisher.exe"
-          onclick="trackDownload(event, 'PPT2SCORM_Publisher.exe', this.href)">
+          onclick="trackDownload(event, 'PPT2SCORM_Publisher.exe', this.href)"
+        >
           Download
         </a>
       </div>
 
-      <!-- Row 2 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">PPTLayerManager</p>
-          <p class="file-size">EXE • 8.7 MB</p>
+          <p class="file-size">EXE • 156 MB</p>
         </div>
-        <a class="download-btn"
+        <a
+          class="download-btn"
           href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPTLayerManager.exe"
-          onclick="trackDownload(event, 'PPTLayerManager.exe', this.href)">
+          onclick="trackDownload(event, 'PPTLayerManager.exe', this.href)"
+        >
           Download
         </a>
       </div>
 
-      <!-- Row 3 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">Tutorial (PDF)</p>
-          <p class="file-size">PDF • 2.1 MB</p>
+          <p class="file-size">PDF • 2.01 MB</p>
         </div>
-        <a class="download-btn"
-          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Tutorial.pdf"
-          onclick="trackDownload(event, 'PPT2SCORM_Tutorial.pdf', this.href)">
+        <a
+          class="download-btn"
+          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM.guide.pdf"
+          onclick="trackDownload(event, 'PPT2SCORM.guide.pdf', this.href)"
+        >
           Download
         </a>
       </div>
 
-      <!-- Row 4 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">Demo Video</p>
-          <p class="file-size">MP4 • 45.0 MB</p>
+          <p class="file-size">MP4 • 212 MB</p>
         </div>
-        <a class="download-btn"
-          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Demo_Video.mp4"
-          onclick="trackDownload(event, 'PPT2SCORM_Demo_Video.mp4', this.href)">
+        <a
+          class="download-btn"
+          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/Demo_Video.mp4"
+          onclick="trackDownload(event, 'Demo_Video.mp4', this.href)"
+        >
           Download
         </a>
       </div>
 
     </div>
 
-    <!-- Illustration -->
     <div class="illustration">
-      <img src="https://joebasara.github.io/PPT2SCORM/onmyway.png" alt="Illustration">
+      <img src="https://joebasara.github.io/PPT2SCORM/onmyway.png" alt="Illustration" />
     </div>
   </div>
 
