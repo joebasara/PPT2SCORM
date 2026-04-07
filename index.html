@@ -17,62 +17,200 @@
   </script>
 
   <style>
+    :root {
+      --bg-pink: #f3e1e6;
+      --purple: #5b57d9;
+      --purple-dark: #4c47c7;
+      --purple-light: #d7d2fb;
+      --white: #ffffff;
+      --shadow: 0 18px 40px rgba(91, 87, 217, 0.16);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       font-family: Arial, sans-serif;
-      background-color: #f2f2f2;
-      text-align: center;
-      padding: 50px;
+      background-color: var(--bg-pink);
       margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 16px;
     }
 
-    h1 {
-      color: #333;
-      margin-bottom: 16px;
+    .downloads-window {
+      width: 100%;
+      max-width: 760px;
+      background: var(--white);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
     }
 
-    p {
-      font-size: 18px;
-      color: #555;
-      margin-bottom: 40px;
+    .window-title {
+      background: var(--purple);
+      color: var(--white);
+      text-align: center;
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      padding: 22px 24px;
+    }
+
+    .downloads-list {
+      padding: 22px;
+    }
+
+    .download-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      border: 1px solid var(--purple-light);
+      border-radius: 12px;
+      padding: 18px 20px;
+      margin-bottom: 14px;
+      background: var(--white);
+    }
+
+    .download-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .file-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .file-name {
+      margin: 0 0 6px 0;
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--purple);
+      word-break: break-word;
+    }
+
+    .file-size {
+      margin: 0;
+      font-size: 14px;
+      color: var(--purple);
+      opacity: 0.75;
     }
 
     .download-btn {
-      display: inline-block;
-      padding: 15px 30px;
-      margin: 10px;
-      font-size: 18px;
-      font-weight: bold;
-      color: #ffffff;
-      background-color: #007bff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 132px;
+      padding: 12px 18px;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--purple);
+      background-color: var(--white);
       text-decoration: none;
-      border-radius: 8px;
-      transition: background-color 0.3s ease;
+      border: 1px solid var(--purple);
+      border-radius: 10px;
+      transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease;
+      flex-shrink: 0;
     }
 
     .download-btn:hover {
-      background-color: #0056b3;
+      background-color: var(--purple);
+      color: var(--white);
+      border-color: var(--purple);
+    }
+
+    @media (max-width: 640px) {
+      .window-title {
+        font-size: 20px;
+        padding: 18px 20px;
+      }
+
+      .downloads-list {
+        padding: 16px;
+      }
+
+      .download-row {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .download-btn {
+        width: 100%;
+        min-width: 0;
+      }
+
+      .file-name {
+        font-size: 18px;
+      }
     }
   </style>
 </head>
 <body>
-  <h1>PPT2SCORM Tools</h1>
-  <p>Download the tools to manage and publish your PowerPoint to SCORM packages quickly and easily.</p>
+  <div class="downloads-window">
+    <div class="window-title">DOWNLOADS</div>
 
-  <a
-    class="download-btn"
-    href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Publisher.exe"
-    onclick="trackDownload(event, 'PPT2SCORM_Publisher.exe', this.href)"
-  >
-    Download PPT2SCORM Publisher
-  </a>
+    <div class="downloads-list">
+      <div class="download-row">
+        <div class="file-info">
+          <p class="file-name">PPT2SCORM_Publisher</p>
+          <p class="file-size">EXE • 12.4 MB</p>
+        </div>
+        <a
+          class="download-btn"
+          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Publisher.exe"
+          onclick="trackDownload(event, 'PPT2SCORM_Publisher.exe', this.href)"
+        >
+          Download
+        </a>
+      </div>
 
-  <a
-    class="download-btn"
-    href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPTLayerManager.exe"
-    onclick="trackDownload(event, 'PPTLayerManager.exe', this.href)"
-  >
-    Download PPT Layer Manager
-  </a>
+      <div class="download-row">
+        <div class="file-info">
+          <p class="file-name">PPTLayerManager</p>
+          <p class="file-size">EXE • 8.7 MB</p>
+        </div>
+        <a
+          class="download-btn"
+          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPTLayerManager.exe"
+          onclick="trackDownload(event, 'PPTLayerManager.exe', this.href)"
+        >
+          Download
+        </a>
+      </div>
+
+      <div class="download-row">
+        <div class="file-info">
+          <p class="file-name">Tutorial (PDF)</p>
+          <p class="file-size">PDF • 2.1 MB</p>
+        </div>
+        <a
+          class="download-btn"
+          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Tutorial.pdf"
+          onclick="trackDownload(event, 'PPT2SCORM_Tutorial.pdf', this.href)"
+        >
+          Download
+        </a>
+      </div>
+
+      <div class="download-row">
+        <div class="file-info">
+          <p class="file-name">Demo Video</p>
+          <p class="file-size">MP4 • 45.0 MB</p>
+        </div>
+        <a
+          class="download-btn"
+          href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Demo_Video.mp4"
+          onclick="trackDownload(event, 'PPT2SCORM_Demo_Video.mp4', this.href)"
+        >
+          Download
+        </a>
+      </div>
+    </div>
+  </div>
 
   <script>
     function trackDownload(event, fileName, url) {
