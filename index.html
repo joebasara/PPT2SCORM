@@ -20,7 +20,6 @@
     :root {
       --bg-pink: #f3e1e6;
       --purple: #5b57d9;
-      --purple-dark: #4c47c7;
       --purple-light: #d7d2fb;
       --white: #ffffff;
       --shadow: 0 18px 40px rgba(91, 87, 217, 0.16);
@@ -57,7 +56,7 @@
       font-size: 24px;
       font-weight: 700;
       letter-spacing: 1px;
-      padding: 22px 24px;
+      padding: 22px;
     }
 
     .downloads-list {
@@ -73,7 +72,6 @@
       border-radius: 12px;
       padding: 18px 20px;
       margin-bottom: 14px;
-      background: var(--white);
     }
 
     .download-row:last-child {
@@ -82,57 +80,52 @@
 
     .file-info {
       flex: 1;
-      min-width: 0;
     }
 
     .file-name {
       margin: 0 0 6px 0;
       font-size: 22px;
-      font-weight: 700;
+      font-weight: bold;
       color: var(--purple);
-      word-break: break-word;
     }
 
     .file-size {
       margin: 0;
       font-size: 14px;
       color: var(--purple);
-      opacity: 0.75;
+      opacity: 0.7;
     }
 
     .download-btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 132px;
+      min-width: 130px;
       padding: 12px 18px;
       font-size: 15px;
-      font-weight: 700;
+      font-weight: bold;
       color: var(--purple);
       background-color: var(--white);
       text-decoration: none;
       border: 1px solid var(--purple);
       border-radius: 10px;
-      transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease;
-      flex-shrink: 0;
+      transition: 0.25s;
     }
 
     .download-btn:hover {
       background-color: var(--purple);
       color: var(--white);
-      border-color: var(--purple);
+    }
+
+    .illustration {
+      text-align: center;
+      padding: 20px 20px 30px;
+    }
+
+    .illustration img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 10px;
     }
 
     @media (max-width: 640px) {
-      .window-title {
-        font-size: 20px;
-        padding: 18px 20px;
-      }
-
-      .downloads-list {
-        padding: 16px;
-      }
-
       .download-row {
         flex-direction: column;
         align-items: flex-start;
@@ -140,75 +133,74 @@
 
       .download-btn {
         width: 100%;
-        min-width: 0;
-      }
-
-      .file-name {
-        font-size: 18px;
       }
     }
   </style>
 </head>
+
 <body>
   <div class="downloads-window">
     <div class="window-title">DOWNLOADS</div>
 
     <div class="downloads-list">
+
+      <!-- Row 1 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">PPT2SCORM_Publisher</p>
           <p class="file-size">EXE • 12.4 MB</p>
         </div>
-        <a
-          class="download-btn"
+        <a class="download-btn"
           href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Publisher.exe"
-          onclick="trackDownload(event, 'PPT2SCORM_Publisher.exe', this.href)"
-        >
+          onclick="trackDownload(event, 'PPT2SCORM_Publisher.exe', this.href)">
           Download
         </a>
       </div>
 
+      <!-- Row 2 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">PPTLayerManager</p>
           <p class="file-size">EXE • 8.7 MB</p>
         </div>
-        <a
-          class="download-btn"
+        <a class="download-btn"
           href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPTLayerManager.exe"
-          onclick="trackDownload(event, 'PPTLayerManager.exe', this.href)"
-        >
+          onclick="trackDownload(event, 'PPTLayerManager.exe', this.href)">
           Download
         </a>
       </div>
 
+      <!-- Row 3 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">Tutorial (PDF)</p>
           <p class="file-size">PDF • 2.1 MB</p>
         </div>
-        <a
-          class="download-btn"
+        <a class="download-btn"
           href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Tutorial.pdf"
-          onclick="trackDownload(event, 'PPT2SCORM_Tutorial.pdf', this.href)"
-        >
+          onclick="trackDownload(event, 'PPT2SCORM_Tutorial.pdf', this.href)">
           Download
         </a>
       </div>
 
+      <!-- Row 4 -->
       <div class="download-row">
         <div class="file-info">
           <p class="file-name">Demo Video</p>
           <p class="file-size">MP4 • 45.0 MB</p>
         </div>
-        <a
-          class="download-btn"
+        <a class="download-btn"
           href="https://github.com/joebasara/PPT2SCORM/releases/download/PPT2SCORM/PPT2SCORM_Demo_Video.mp4"
-          onclick="trackDownload(event, 'PPT2SCORM_Demo_Video.mp4', this.href)"
-        >
+          onclick="trackDownload(event, 'PPT2SCORM_Demo_Video.mp4', this.href)">
           Download
         </a>
       </div>
+
+    </div>
+
+    <!-- Illustration -->
+    <div class="illustration">
+      <img src="https://joebasara.github.io/PPT2SCORM/onmyway.png" alt="Illustration">
     </div>
   </div>
 
@@ -223,7 +215,7 @@
           transport_type: 'beacon'
         });
       } catch (error) {
-        console.error('Google Analytics event error:', error);
+        console.error('GA error:', error);
       }
 
       setTimeout(function () {
